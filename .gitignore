@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+
+# Chrome profiles (มี cookie ส่วนตัว ห้ามขึ้น git)
+profiles/
+
+# Local credentials override
+app/presets_local.py
+
+# Test/debug outputs
+Test_*/
+Diag_*/
+Downloads/
+Ridi_Download/
+Bomtoon_Download/
+Kakao_Download/
+Lezhin_Download/
+Toptoon_Download/
+โหลด/
+*.rar
+*.zip
+
+# config (ส่วนตัว)
+config.json
+
+# IDE
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

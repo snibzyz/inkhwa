@@ -1,0 +1,104 @@
+"""KakaoPage downloader (URL + page-edge.kakao.com)"""
+from __future__ import annotations
+
+import os
+import time
+
+from bs4 import BeautifulSoup
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.common.exceptions import TimeoutException
+
+from .base import (
+    BaseDownloader,
+    DownloaderContext,
+    register_downloader,
+    sanitize_filename,
+    make_requests_session,
+    download_url_to,
+)
+
+
+@register_downloader
+class KakaoDownloader(BaseDownloader):
+    name = "Kakao"
+    url = "https://page.kakao.com"
+    profile_dir = "Chrome_Kakao_Profile"
+    file_ext = ".jpeg"
+
+    def get_chapter_name(self, driver) -> str:
+        # ใช้ส่วนท้าย URL เป็นชื่อตอน
+        try:
+            url_part = driver.current_url.rstrip("/").split("/")[-1]
+            title = driver.title.split("|")[0].strip()
+            return sanitize_filename(f"{title}_{url_part}") if title else sanitize_filename(url_part)
+        except Exception:
+            return f"Kakao_{int(time.time())}"
+
+    def download_chapter(self, driver, save_path, ctx: DownloaderContext) -> int:
+        ctx.log("   - 🎯 เริ่มดาวน์โหลด (URL mode)")
+        try:
+            WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, "img[src*='page-edge.kakao.com']")
+                )
+            )
+        except TimeoutException:
+            ctx.log("   ❌ ไม่พบรูปภาพ (อาจต้องซื้อตอน)")
+            return 0
+
+        html = driver.page_source
+        soup = BeautifulSoup(html, "html.parser")
+        image_tags = soup.find_all("img", src=lambda s: s and "page-edge.kakao.com" in s)
+        if not image_tags:
+            ctx.log("   ❌ ไม่พบรูปภาพ")
+            return 0
+
+        urls = [img["src"] for img in image_tags]
+        total = len(urls)
+        ctx.log(f"   - 📦 พบ {total} รูป")
+        session = make_requests_session(driver)
+
+        count = 0
+        for i, url in enumerate(urls):
+            if not ctx.is_running():
+                break
+            filename = f"{i+1:03d}.jpeg"
+            fpath = os.path.join(save_path, filename)
+            if os.path.exists(fpath) and os.path.getsize(fpath) > 0:
+                count += 1
+                continue
+            if download_url_to(session, url, fpath, timeout=30):
+                count += 1
+                ctx.log(f"      ✅ Save: {filename} [{count}/{total}]")
+                ctx.progress(count, total)
+            else:
+                ctx.log(f"      ❌ Failed: {filename}")
+        return count
+
+    def click_next(self, driver, ctx: DownloaderContext) -> bool:
+        wait = WebDriverWait(driver, 15)
+        try:
+            # ปลุก UI
+            viewer = wait.until(
+                EC.presence_of_element_located(
+                    (By.CSS_SELECTOR, "img[src*='page-edge.kakao.com']")
+                )
+            )
+            ActionChains(driver).move_to_element(viewer).click().perform()
+            time.sleep(1)
+            btn = wait.until(
+                EC.element_to_be_clickable(
+                    (By.CSS_SELECTOR, 'div[data-test="viewer-navbar-next-button"]')
+                )
+            )
+            driver.execute_script("arguments[0].click();", btn)
+            ctx.log("   - 🖱️ คลิก Next")
+            return True
+        except TimeoutException:
+            return False
+        except Exception as e:
+            ctx.log(f"   ⚠️ click next error: {e}")
+            return False
