@@ -18,15 +18,6 @@ LOGIN_URL = "https://www.bomtoon.com/user/login"
 CHAPTER_URL = os.environ.get("INKHWA_TEST_URL", "https://www.bomtoon.com/viewer/Mon_Love/1")
 LOGIN_ID = os.environ.get("INKHWA_USER", "")
 LOGIN_PW = os.environ.get("INKHWA_PASS", "")
-if not LOGIN_ID:
-    try:
-        from app.presets_local import LOGIN_PRESETS as _LP  # type: ignore
-        first = next(iter(_LP.values()), None)
-        if first:
-            LOGIN_ID = first.get("user", "")
-            LOGIN_PW = first.get("password", "")
-    except Exception:
-        pass
 
 OUT_DIR = os.path.join(PROJECT_ROOT, "Test_Bomtoon")
 os.makedirs(OUT_DIR, exist_ok=True)

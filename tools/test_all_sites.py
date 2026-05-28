@@ -20,18 +20,11 @@ if ROOT not in sys.path:
 
 from downloaders import get_downloader, ChromeManager, DownloaderContext
 
-# อ่านจาก env var หรือ app/presets_local.py
+# อ่านจาก env var เท่านั้น — set ก่อนรัน:
+#   PowerShell: $env:INKHWA_USER='you@example.com'; $env:INKHWA_PASS='yourpw'
+#   cmd:        set INKHWA_USER=you@example.com & set INKHWA_PASS=yourpw
 CREDS_USER = os.environ.get("INKHWA_USER", "")
 CREDS_PASS = os.environ.get("INKHWA_PASS", "")
-if not CREDS_USER:
-    try:
-        from app.presets_local import LOGIN_PRESETS as _LP  # type: ignore
-        first = next(iter(_LP.values()), None)
-        if first:
-            CREDS_USER = first.get("user", "")
-            CREDS_PASS = first.get("password", "")
-    except Exception:
-        pass
 MAX_IMAGES = 5
 OUT_BASE = os.path.join(ROOT, "Test_AllSites")
 os.makedirs(OUT_BASE, exist_ok=True)

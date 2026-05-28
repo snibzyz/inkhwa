@@ -10,8 +10,9 @@ env/
 # Chrome profiles (มี cookie ส่วนตัว ห้ามขึ้น git)
 profiles/
 
-# Local credentials override
-app/presets_local.py
+# Local data (login history, saved logs)
+.login_history.json
+inkhwa-log-*.txt
 
 # Test/debug outputs
 Test_*/

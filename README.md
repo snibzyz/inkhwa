@@ -70,17 +70,19 @@ inkhwa/
 
 โปรแกรมจะลูปไปทุกตอน คลิก Next อัตโนมัติจนจบเรื่อง
 
-### Login Presets
+### Login
 
-เก็บ preset ส่วนตัวที่ไม่ถูก commit ใน `app/presets_local.py`:
+- User: combobox จำ user เคยใช้ (เก็บที่ `.login_history.json` — ไม่อยู่ใน git)
+- Password: ไม่บันทึก ต้องใส่ใหม่ทุกครั้ง (security)
+- Show/Hide toggle สำหรับ password
+- รองรับ auto-login เฉพาะ Bomtoon (ปัจจุบัน)
 
-```python
-LOGIN_PRESETS = {
-    "myacct": {"user": "you@example.com", "password": "yourpw"},
-}
-```
+### Log
 
-ไฟล์ `app/presets_local.py` อยู่ใน `.gitignore`
+- Copy → คัดลอกทั้งหมดลง clipboard
+- Save → save log เป็นไฟล์ .txt
+- Clear → ล้าง log
+- Text เลือก/copy ได้ด้วย mouse + keyboard
 
 ## พัฒนาเว็บใหม่
 
