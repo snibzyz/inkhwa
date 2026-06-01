@@ -58,6 +58,10 @@ class BomtoonDownloader(BaseDownloader):
     profile_dir = "Chrome_Bomtoon_Profile"
     file_ext = ".jpg"
 
+    # (prefix, เลขตอน) ที่จับไว้ "ตอนเริ่มโหลด" ก่อน scroll — ใช้คำนวณตอนถัดไป
+    # กัน viewer auto-advance ทำ current_url ดริฟต์ (ดู download_chapter/click_next)
+    _episode_at_start = None
+
     # ----- login helpers -----
     @staticmethod
     def _find_password_input(driver):
@@ -86,11 +90,39 @@ class BomtoonDownloader(BaseDownloader):
                     continue
         return None
 
-    def is_logged_in(self, driver) -> Optional[bool]:
-        """ตรวจสถานะ login แบบ passive (ไม่เปลี่ยนหน้า)
+    # ชื่อ cookie ที่บ่งบอกว่า "มี session/ล็อกอินแล้ว" (เดาจากคำในชื่อ)
+    _AUTH_COOKIE_HINTS = (
+        "token", "session", "sess", "auth", "access", "refresh",
+        "login", "member", "user", "uid", "sid", "passport",
+    )
 
-        ใช้ตัวตรวจกลางก่อน (ปุ่ม 로그인/로그아웃/마이페이지) ถ้าไม่ชัดเจน
-        ค่อย fallback ดูจากช่อง password / การหลุดจากหน้า login
+    def auth_cookies(self, driver) -> list[dict]:
+        """คืน cookie ของ bomtoon ที่ "ดูเหมือน session/auth" (ไว้ตรวจ + log)"""
+        found = []
+        try:
+            for c in driver.get_cookies():
+                dom = (c.get("domain") or "").lower()
+                if "bomtoon" not in dom:
+                    continue
+                name = (c.get("name") or "")
+                val = c.get("value") or ""
+                if not val:
+                    continue
+                lname = name.lower()
+                is_jwt = val.count(".") == 2 and len(val) > 40
+                if (any(h in lname for h in self._AUTH_COOKIE_HINTS) and len(val) >= 16) or is_jwt:
+                    found.append({"name": name, "len": len(val), "jwt": is_jwt})
+        except Exception:
+            pass
+        return found
+
+    def is_logged_in(self, driver) -> Optional[bool]:
+        """ตรวจสถานะ login แบบ passive (ไม่เปลี่ยนหน้า) — smart detect
+
+        ลำดับ (เรียงตามความน่าเชื่อถือ):
+          1) ตัวตรวจกลาง: เจอปุ่ม 로그인 ชัด ๆ = ยังไม่ login / เจอ 로그아웃 = login แล้ว
+          2) เห็นช่อง password = ยังไม่ login (อยู่บนฟอร์ม login)
+          3) หน้า login "ว่าง" (login แล้ว bomtoon ไม่โชว์ฟอร์ม) → ดูจาก session cookie
         """
         base = super().is_logged_in(driver)
         if base is not None:
@@ -101,8 +133,10 @@ class BomtoonDownloader(BaseDownloader):
                 return False
         except Exception:
             pass
-        # นอกนั้นไม่ชัวร์ → คืน None ให้ผู้ใช้ยืนยันเอง
-        # (ห้ามเดาว่า "หลุดจากหน้า login = login แล้ว" เพราะ login fail ก็ redirect ได้)
+        # มาถึงนี่ = ไม่เจอปุ่ม login ชัด ๆ และไม่มีฟอร์ม (เช่นหน้า login ว่างเพราะ
+        # login ไปแล้ว) → ใช้ session cookie เป็นสัญญาณบวก
+        if self.auth_cookies(driver):
+            return True
         return None
 
     # ----- login -----
@@ -171,19 +205,73 @@ class BomtoonDownloader(BaseDownloader):
             ctx.log(f"   ⚠️ ลบ SN ไม่ได้: {e}")
             return 0
 
-    def _scroll_to_load(self, driver, ctx: DownloaderContext):
-        """ค่อย ๆ scroll ลงจนถึงล่างเพื่อปลุก lazy-load ทุกรูป"""
+    # ล็อก SPA router ไม่ให้เด้งไปตอนอื่นระหว่าง scroll
+    # Bomtoon เป็น Next.js: auto-advance ตอนถัดไปด้วย history.pushState เมื่อ scroll
+    # ลงลึก → override ให้ปฏิเสธการเปลี่ยน path (อยู่ตอนเดิม เก็บรูปครบทั้งตอน)
+    _LOCK_NAV_JS = r"""
+(() => {
+  if (window.__navLocked) return;
+  const lockPath = location.pathname;
+  const p = history.pushState.bind(history);
+  const r = history.replaceState.bind(history);
+  history.pushState = function(s,t,u){
+    try { if (u && new URL(u, location.href).pathname !== lockPath) return; } catch(e){}
+    return p(s,t,u);
+  };
+  history.replaceState = function(s,t,u){
+    try { if (u && new URL(u, location.href).pathname !== lockPath) return; } catch(e){}
+    return r(s,t,u);
+  };
+  window.__navLocked = true;
+})();
+"""
+
+    # scroll ลงทีละขั้น + หยุดทันทีที่ location.href เปลี่ยน (viewer auto-advance)
+    # + safety timeout 22s กัน hang ('script timeout')
+    # หยุดเมื่อ "ถึงล่าง + scrollHeight นิ่ง" (รอ lazy-load ขยายหน้าจนสุด)
+    # ไม่ใช่แค่แตะล่างครั้งเดียว เพราะหน้าโตเรื่อย ๆ ตอน scroll (lazy)
+    _SCROLL_ASYNC_JS = r"""
+const done = arguments[arguments.length - 1];
+const startUrl = location.href;
+let lastH = -1, stable = 0;
+const t0 = Date.now();
+const id = setInterval(() => {
+  try {
+    if (location.href !== startUrl) { clearInterval(id); window.scrollTo(0,0); done('drift'); return; }
+    if (Date.now() - t0 > 30000) { clearInterval(id); window.scrollTo(0,0); done('timeout'); return; }
+    const sh = document.body.scrollHeight;
+    window.scrollBy(0, 1400);
+    const atBottom = (window.scrollY + window.innerHeight >= sh - 4);
+    if (atBottom && sh === lastH) {
+      stable++;
+      if (stable >= 8) { clearInterval(id); window.scrollTo(0,0); done('bottom'); return; }
+    } else {
+      stable = 0;
+    }
+    lastH = sh;
+  } catch (e) { clearInterval(id); done('error'); }
+}, 110);
+"""
+
+    def _scroll_to_load(self, driver, ctx: DownloaderContext) -> str:
+        """scroll ลงทีละขั้นเพื่อปลุก lazy-load — หยุดทันทีถ้า URL เด้ง (auto-advance)
+
+        คืนสถานะ: 'bottom' (ถึงล่างปกติ) / 'drift' (viewer เด้งไปตอนอื่น) /
+                  'timeout' / 'error'
+        """
         try:
-            driver.execute_script(
-                "return (async()=>{"
-                "await new Promise(r=>{let t=0;const d=600;const id=setInterval(()=>{"
-                "const sh=document.body.scrollHeight;window.scrollBy(0,d);t+=d;"
-                "if(t>=sh+1000){clearInterval(id);window.scrollTo(0,0);r();}},150);});"
-                "})();"
-            )
-            time.sleep(1.5)
+            driver.set_script_timeout(40)
+        except Exception:
+            pass
+        try:
+            result = driver.execute_async_script(self._SCROLL_ASYNC_JS)
         except Exception as e:
             ctx.log(f"   ⚠️ scroll error: {e}")
+            return "error"
+        time.sleep(0.8)
+        if result == "drift":
+            ctx.log("   ⚠️ viewer เด้งไปตอนอื่นระหว่าง scroll")
+        return result or "bottom"
 
     def _collect_comic_imgs(self, driver):
         """คืน list<WebElement> เฉพาะ <img> ที่เป็นรูปการ์ตูน (กรอง UI/thumbnail ออก)"""
@@ -212,6 +300,16 @@ class BomtoonDownloader(BaseDownloader):
     def download_chapter(self, driver, save_path, ctx: DownloaderContext) -> int:
         ctx.log("   - 🎯 เริ่มดาวน์โหลด (blob → canvas + SN strip)")
 
+        # จับเลขตอน "ก่อน" scroll — กัน viewer auto-advance ทำ current_url ดริฟต์
+        # แล้วไปตอนถัดไปผิด (ข้ามตอน) หรือเก็บรูปผิดตอน
+        self._episode_at_start = self._episode_url_parts(driver.current_url)
+        ep = self._episode_at_start
+        try:
+            cur = driver.current_url or ""
+        except Exception:
+            cur = ""
+        ctx.log(f"   - 📍 เช็ค URL: {cur}" + (f"  (ตอน {ep[1]})" if ep else "  (ไม่ใช่เลขตอน)"))
+
         try:
             WebDriverWait(driver, 15).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, "img"))
@@ -220,11 +318,31 @@ class BomtoonDownloader(BaseDownloader):
             ctx.log("   ❌ ไม่พบ img element")
             return 0
 
-        # ลบ SN ครั้งแรก
-        self._strip_sn(driver, ctx)
+        # ล็อก SPA ไม่ให้เด้งไปตอนอื่นตอน scroll (กันเก็บรูปผิดตอน/ไม่ครบ)
+        try:
+            driver.execute_script(self._LOCK_NAV_JS)
+        except Exception:
+            pass
 
-        # scroll ปลุก lazy load
-        self._scroll_to_load(driver, ctx)
+        # ลบ SN + scroll ปลุก lazy load
+        self._strip_sn(driver, ctx)
+        status = self._scroll_to_load(driver, ctx)
+
+        # ถ้า viewer เด้งออกจากตอนนี้ (auto-advance) → กลับมาโหลดตอนเดิมใหม่
+        # (กันได้รูปผิดตอน) — ทำครั้งเดียวพอ
+        if ep and (status == "drift" or self._episode_url_parts(driver.current_url) != ep):
+            want = f"{ep[0]}{ep[1]}"
+            ctx.log(f"   ⚠️ เด้งออกจากตอน {ep[1]} — กลับไปโหลดใหม่: {want}")
+            try:
+                driver.get(want)
+                time.sleep(3)
+                WebDriverWait(driver, 15).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, "img"))
+                )
+            except Exception:
+                pass
+            self._strip_sn(driver, ctx)
+            self._scroll_to_load(driver, ctx)
 
         # ลบ SN อีกรอบ (กรณีมี element ใหม่หลัง scroll)
         self._strip_sn(driver, ctx)
@@ -343,7 +461,75 @@ class BomtoonDownloader(BaseDownloader):
     }
     """
 
+    # URL ตอนของ Bomtoon เป็นเลขจำนวนเต็มเรียงตรง: /viewer/<series>/<N>
+    # (เลข >= 10000 ถือว่าเป็น ID ไม่ใช่เลขตอน → ไม่บวก URL, ใช้ปุ่มแทน)
+    _VIEWER_NUM_RE = re.compile(r"^(.*/viewer/[^/]+/)(\d+)/?$")
+
+    def _episode_url_parts(self, url: str):
+        """คืน (prefix, number) ถ้า url เป็นรูปแบบ /viewer/<series>/<เลขตอน>"""
+        base = (url or "").split("#")[0].split("?")[0]
+        m = self._VIEWER_NUM_RE.match(base)
+        if not m:
+            return None
+        n = int(m.group(2))
+        if n >= 10000:        # น่าจะเป็น ID ไม่ใช่เลขตอน
+            return None
+        return (m.group(1), n)
+
     def click_next(self, driver, ctx: DownloaderContext) -> bool:
+        """ไปตอนถัดไป — ใช้การบวกเลข URL เป็นหลัก (ชัวร์ ไม่ข้ามตอน)
+
+        ปุ่ม React '다음화' ของ Bomtoon คลิกแล้วบางครั้งกระโดดข้ามตอน
+        แต่ URL เป็นเลขเรียงตรง ๆ จึงเด้งไปตอน N+1 ตรง ๆ แทน
+        ใช้ "เลขตอนที่จับไว้ตอนเริ่มโหลด" (ก่อน scroll) เป็นหลัก เพราะ current_url
+        อาจดริฟต์จาก viewer auto-advance ถ้าไม่มีค่อยใช้ current_url
+        ถ้า URL ไม่ใช่รูปแบบเลขตอน (เช่นเป็น ID) ค่อย fallback ไปใช้ปุ่ม
+        """
+        parts = self._episode_at_start or self._episode_url_parts(driver.current_url)
+        self._episode_at_start = None   # ใช้แล้วเคลียร์ กันค้างไปตอนหน้า
+        if parts:
+            prefix, n = parts
+            next_url = f"{prefix}{n + 1}"
+            ctx.log(f"   - ▶️ ไปตอนถัดไป (URL): {next_url}")
+            try:
+                driver.get(next_url)
+            except Exception as e:
+                ctx.log(f"   ⚠️ เปิดตอนถัดไปไม่ได้: {e}")
+                return False
+            time.sleep(2)
+            new_url = driver.current_url or ""
+            ctx.log(f"   - 📍 เช็ค URL หลังไปต่อ: {new_url}")
+            want = n + 1
+            # ถูก redirect ออกจาก viewer (เช่นกลับหน้า main) = จบเรื่องแล้ว
+            if "/viewer/" not in new_url:
+                ctx.log("   🛑 ไม่มีตอนถัดไป (ออกจากหน้า viewer = จบเรื่อง)")
+                return False
+            np = self._episode_url_parts(new_url)
+            if np is None:
+                ctx.log("   ✅ ถึงตอนถัดไปแล้ว")
+                return True
+            if np[1] == want:
+                ctx.log(f"   ✅ ยืนยัน: อยู่ตอน {want} ถูกต้อง")
+                return True
+            if np[1] == n:
+                ctx.log("   🛑 ยังเป็นตอนเดิม (ไม่ขยับ) = จบเรื่อง")
+                return False
+            # ไปไม่ตรงตอนที่ตั้งใจ (viewer เด้ง?) → บังคับกลับไปตอนที่ถูก
+            ctx.log(f"   ⚠️ ควรไปตอน {want} แต่ไปตอน {np[1]} — บังคับกลับ {next_url}")
+            try:
+                driver.get(next_url)
+                time.sleep(2)
+                fix = self._episode_url_parts(driver.current_url or "")
+                ctx.log(f"   - 📍 เช็ค URL หลังแก้: {driver.current_url}")
+                if fix and fix[1] == want:
+                    ctx.log(f"   ✅ แก้แล้ว อยู่ตอน {want}")
+            except Exception:
+                pass
+            return True
+        # URL ไม่ใช่เลขตอน → ใช้ปุ่ม 다음화 เดิม
+        return self._click_next_button(driver, ctx)
+
+    def _click_next_button(self, driver, ctx: DownloaderContext) -> bool:
         # 1) วิธีหลัก: หา <div> ปุ่ม next ด้วย JS (รองรับ React div-button)
         try:
             result = driver.execute_script("return (" + self._NEXT_JS + ")();")

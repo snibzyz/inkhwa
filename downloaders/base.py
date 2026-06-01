@@ -97,6 +97,16 @@ class DownloaderContext:
     progress: Callable[[int, int], None] = field(default=lambda c, t: None)
     is_running: Callable[[], bool] = field(default=lambda: True)
 
+    # --- การตั้งชื่อโฟลเดอร์ตอน ---
+    # ถ้า folder_start != None → ตั้งชื่อโฟลเดอร์เป็นเลขลำดับเริ่มจากค่านี้ (เช่น 01, 02, ...)
+    # ถ้า None → ใช้ชื่อจาก get_chapter_name() (ชื่อจากหน้าเว็บ) เหมือนเดิม
+    folder_start: Optional[int] = None
+    folder_pad: int = 2
+
+    # --- hook ที่ถูกเรียกหลังโหลดแต่ละตอนเสร็จ (ใช้ทำ auto-merge) ---
+    # รับ (save_path, saved_count)
+    after_chapter: Callable[[str, int], None] = field(default=lambda p, n: None)
+
 
 # =========================================================================
 # Chrome Manager - undetected_chromedriver
@@ -186,14 +196,73 @@ class ChromeManager:
 
         self.log("✅ เปิด Chrome สำเร็จ")
 
+        # บางโปรไฟล์ตั้ง "เปิดแท็บเดิมต่อ" (session restore) → Chrome เปิดหลายแท็บ/
+        # หน้าต่าง แล้ว get() อาจวิ่งไปคนละแท็บกับที่โชว์ ทำให้ค้างหน้า New Tab
+        # จึงรวมให้เหลือแท็บเดียวก่อน แล้วค่อย navigate แบบตรวจสอบ+ลองซ้ำ
+        self._consolidate_windows()
+
         if start_url:
-            try:
-                self.driver.get(start_url)
-                self.log(f"🌐 เปิด URL: {start_url}")
-            except Exception as e:
-                self.log(f"⚠️ เปิด URL ไม่ได้: {e}")
+            self._navigate(start_url)
 
         return self.driver
+
+    def _consolidate_windows(self):
+        """ปิดแท็บ/หน้าต่างที่ restore มา เหลือไว้แท็บเดียว แล้วโฟกัสที่แท็บนั้น"""
+        try:
+            handles = self.driver.window_handles
+            if len(handles) > 1:
+                self.log(f"   🧹 พบ {len(handles)} แท็บ (session restore) — ปิดเหลือแท็บเดียว")
+                for h in handles[:-1]:
+                    try:
+                        self.driver.switch_to.window(h)
+                        self.driver.close()
+                    except Exception:
+                        pass
+            self.driver.switch_to.window(self.driver.window_handles[-1])
+        except Exception:
+            pass
+
+    @staticmethod
+    def _is_blank(url: str) -> bool:
+        """หน้า 'ว่าง' ที่ยังไม่ได้ไปไหน (New Tab / about:blank / data:)"""
+        low = (url or "").strip().lower()
+        if not low:
+            return True
+        return (
+            low.startswith("chrome://")
+            or low.startswith("about:")
+            or low.startswith("data:")
+            or low.startswith("edge://")
+            or "newtab" in low
+        )
+
+    def _navigate(self, url: str, attempts: int = 3):
+        """เปิด URL แล้วตรวจว่าออกจากหน้า New Tab ไปหน้าเว็บจริง ถ้ายังค้างให้ลองซ้ำ
+
+        ถือว่าสำเร็จเมื่อไม่ได้อยู่หน้า chrome://newtab / about:blank แล้ว
+        (รองรับ SSO ที่ redirect ข้าม host เช่น Kakao ด้วย)
+        """
+        for i in range(attempts):
+            try:
+                self.driver.get(url)
+            except Exception as e:
+                self.log(f"⚠️ เปิด URL ไม่ได้ (ครั้งที่ {i+1}): {e}")
+                time.sleep(1.0)
+                self._consolidate_windows()
+                continue
+            time.sleep(1.5)
+            try:
+                cur = self.driver.current_url or ""
+            except Exception:
+                cur = ""
+            if not self._is_blank(cur):
+                self.log(f"🌐 เปิด URL: {url}")
+                return
+            # ยังค้างหน้า New Tab → get() อาจวิ่งคนละแท็บ ลองรวมแท็บแล้วทำซ้ำ
+            self.log(f"   ↻ ยังค้างหน้าว่าง (อยู่ที่ {cur or 'ว่าง'}) ลองใหม่...")
+            self._consolidate_windows()
+            time.sleep(0.5)
+        self.log(f"⚠️ เปิด URL ไม่สำเร็จหลังลอง {attempts} ครั้ง — โปรดเปิดหน้า login เองในหน้าต่าง Chrome")
 
     def quit(self):
         if self.driver:
@@ -303,6 +372,30 @@ class BaseDownloader:
         """URL ที่จะเปิดให้ผู้ใช้ login (default = หน้าแรกของเว็บ)"""
         return self.login_url or self.url
 
+    # --------- ตรวจว่า URL นี้เป็น "หน้าอ่าน/ตอน" หรือไม่ ---------
+    def is_chapter_url(self, url: str) -> bool:
+        """หน้านี้เป็นหน้าอ่าน/ตอน ที่เริ่มดาวน์โหลดได้เลยไหม
+
+        ใช้หลัง login: ถ้า user ไม่ได้กรอก URL ตอนแรก แต่หน้าที่เปิดอยู่
+        เป็นหน้าอ่านอยู่แล้ว → เริ่มจากนี่ได้เลย ไม่ต้องถาม
+        ถ้าไม่ใช่ (เช่นหน้า main/home/login) → worker จะถาม URL จากผู้ใช้
+
+        default: เดาจาก keyword ใน path (subclass override ได้ถ้ามี pattern เฉพาะ)
+        """
+        low = (url or "").lower()
+        if not low:
+            return False
+        # หน้าที่ "ไม่ใช่หน้าอ่าน" แน่ ๆ
+        if any(k in low for k in (
+            "/login", "/account", "/main", "/home", "/ranking",
+            "/genre", "/search", "/event", "/notice",
+        )):
+            return False
+        # คำที่บ่งว่าเป็นหน้าอ่าน/ตอน
+        return any(k in low for k in (
+            "/viewer", "/episode", "/chapter", "/ep/", "/content",
+        ))
+
     # --------- optional override: auto-login ---------
     def login(self, driver, username: str, password: str, ctx: DownloaderContext) -> bool:
         """Default: ไม่ทำ auto-login (ผู้ใช้ login เองในหน้าต่าง browser)"""
@@ -370,24 +463,33 @@ class BaseDownloader:
 
     # --------- ลูปกลาง (เรียกจาก worker) ---------
     def run_loop(self, driver, base_save_path: str, ctx: DownloaderContext) -> None:
-        last_folder = ""
+        # last_real = ชื่อจริงจากหน้าเว็บ (ใช้ตรวจ "หน้าซ้ำ = จบเรื่อง")
+        # counter   = เลขลำดับสำหรับตั้งชื่อโฟลเดอร์ (ถ้าเปิดโหมดเลขลำดับ)
+        last_real = ""
+        counter = ctx.folder_start  # None = ใช้ชื่อจากหน้าเว็บ
         while ctx.is_running():
-            chapter_name = self.get_chapter_name(driver)
-            if chapter_name == last_folder:
-                ctx.log(f"   ⚠️ ชื่อตอนซ้ำ ({chapter_name}) รอสักครู่...")
+            real_name = self.get_chapter_name(driver)
+            if real_name == last_real:
+                ctx.log(f"   ⚠️ ชื่อตอนซ้ำ ({real_name}) รอสักครู่...")
                 time.sleep(2)
-                chapter_name = self.get_chapter_name(driver)
-                if chapter_name == last_folder:
+                real_name = self.get_chapter_name(driver)
+                if real_name == last_real:
                     ctx.log("   🛑 หน้าซ้ำเกินไป หรือจบเรื่อง")
                     break
+            last_real = real_name
 
-            last_folder = chapter_name
-            save_path = os.path.join(base_save_path, chapter_name)
+            # ชื่อโฟลเดอร์: เลขลำดับ (เช่น 01) หรือชื่อจากหน้าเว็บ
+            if counter is not None:
+                folder_name = str(counter).zfill(max(1, ctx.folder_pad))
+            else:
+                folder_name = real_name
+
+            save_path = os.path.join(base_save_path, folder_name)
             if not os.path.exists(save_path):
                 os.makedirs(save_path)
                 ctx.log(f"   📁 สร้างโฟลเดอร์: {save_path}")
 
-            ctx.log(f"\n📘 --- กำลังโหลด: {chapter_name} ---")
+            ctx.log(f"\n📘 --- กำลังโหลด: ตอน {folder_name}  ({real_name}) ---")
             ctx.log(f"   💾 บันทึกที่: {save_path}")
             ctx.log(f"   🌐 URL: {driver.current_url}")
 
@@ -397,6 +499,16 @@ class BaseDownloader:
                 ctx.log(f"   ❌ โหลดล้มเหลว: {e}")
                 saved = 0
             ctx.log(f"   📊 สรุป: {saved} ภาพ")
+
+            # hook หลังโหลดตอน (auto-merge ฯลฯ)
+            if saved > 0:
+                try:
+                    ctx.after_chapter(save_path, saved)
+                except Exception as e:
+                    ctx.log(f"   ⚠️ ทำงานหลังโหลดตอนผิดพลาด: {e}")
+
+            if counter is not None:
+                counter += 1
 
             if not ctx.is_running():
                 break

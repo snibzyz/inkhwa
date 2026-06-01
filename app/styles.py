@@ -33,8 +33,8 @@ QGroupBox {{
     background-color: {COLOR_SURFACE};
     border: 1px solid {COLOR_BORDER};
     border-radius: 12px;
-    margin-top: 18px;
-    padding: 16px;
+    margin-top: 16px;
+    padding: 0px;
     font-size: 12pt;
     font-weight: 600;
 }}
@@ -80,6 +80,66 @@ QComboBox QAbstractItemView {{
     padding: 4px;
     selection-background-color: {COLOR_ACCENT};
     outline: 0;
+}}
+QSpinBox {{
+    background-color: {COLOR_SURFACE_HI};
+    border: 1px solid {COLOR_BORDER};
+    border-radius: 8px;
+    padding: 6px 8px;
+    font-size: 11pt;
+    selection-background-color: {COLOR_ACCENT};
+}}
+QSpinBox:focus {{
+    border: 1px solid {COLOR_ACCENT};
+}}
+QSpinBox:disabled {{
+    color: {COLOR_TEXT_DIM};
+    background-color: {COLOR_SURFACE};
+}}
+QSpinBox::up-button, QSpinBox::down-button {{
+    width: 18px;
+    border: none;
+    background: {COLOR_SURFACE};
+}}
+QSpinBox::up-button:hover, QSpinBox::down-button:hover {{
+    background: {COLOR_BORDER};
+}}
+QSpinBox::up-arrow {{
+    image: none; width: 0; height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-bottom: 5px solid {COLOR_TEXT_DIM};
+}}
+QSpinBox::down-arrow {{
+    image: none; width: 0; height: 0;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid {COLOR_TEXT_DIM};
+}}
+QCheckBox {{
+    color: {COLOR_TEXT};
+    font-size: 11pt;
+    font-weight: 500;
+    spacing: 9px;
+    background: transparent;
+}}
+QCheckBox:disabled {{
+    color: {COLOR_TEXT_DIM};
+}}
+QCheckBox::indicator {{
+    width: 20px;
+    height: 20px;
+    border-radius: 6px;
+    border: 1px solid {COLOR_BORDER};
+    background-color: {COLOR_SURFACE_HI};
+}}
+QCheckBox::indicator:hover {{
+    border: 1px solid {COLOR_ACCENT};
+}}
+QCheckBox::indicator:checked {{
+    background-color: {COLOR_ACCENT};
+    border: 1px solid {COLOR_ACCENT};
+    image: none;
 }}
 QPushButton {{
     border-radius: 8px;
@@ -143,15 +203,17 @@ def progress_style() -> str:
 
 
 def log_style() -> str:
+    # ใหญ่ขึ้น อ่านง่ายขึ้น (13pt) + ขอบโค้งดูสะอาด
     return f"""
-        QTextEdit {{
-            background-color: {COLOR_BG};
+        QPlainTextEdit {{
+            background-color: #0B0F14;
             border: 1px solid {COLOR_BORDER};
-            border-radius: 8px;
-            padding: 12px;
-            font-family: 'JetBrains Mono', 'Consolas', monospace;
-            font-size: 10pt;
+            border-radius: 10px;
+            padding: 14px 16px;
+            font-family: 'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace;
+            font-size: 13pt;
             color: {COLOR_TEXT};
+            selection-background-color: {COLOR_ACCENT};
         }}
     """
 
