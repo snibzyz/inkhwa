@@ -18,7 +18,7 @@ if errorlevel 1 (
 )
 
 REM --- Check dependencies ------------------------------------------------
-python -c "import PyQt6, undetected_chromedriver, selenium, requests, bs4" >nul 2>&1
+python -c "import PyQt6, undetected_chromedriver, selenium, requests, bs4, PIL" >nul 2>&1
 if errorlevel 1 (
     echo [!] Installing dependencies...
     python -m pip install --quiet --disable-pip-version-check -r requirements.txt
@@ -27,6 +27,15 @@ if errorlevel 1 (
         pause
         exit /b 1
     )
+)
+
+REM --- Auto-update before launch (git pull / zip) -----------------------
+echo [*] Checking for updates...
+python -m app.selfupdate
+if %errorlevel% equ 2 (
+    echo [*] Updated to the latest version. Relaunching...
+    start "" "%~f0"
+    exit /b 0
 )
 
 REM --- Run app -----------------------------------------------------------

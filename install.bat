@@ -30,6 +30,14 @@ if errorlevel 1 (
 )
 
 echo.
+echo [*] Checking for updates...
+python -m app.selfupdate
+if %errorlevel% equ 2 (
+    echo [*] Updated to the latest version - reinstalling dependencies...
+    python -m pip install -r requirements.txt --disable-pip-version-check
+)
+
+echo.
 echo ============================================
 echo   Install complete - run.bat to start
 echo ============================================
