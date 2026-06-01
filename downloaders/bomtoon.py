@@ -14,6 +14,8 @@ import re
 import time
 import base64
 
+from typing import Optional
+
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
@@ -52,15 +54,63 @@ SN_REMOVE_JS = r"""
 class BomtoonDownloader(BaseDownloader):
     name = "Bomtoon"
     url = "https://www.bomtoon.com"
+    login_url = LOGIN_URL
     profile_dir = "Chrome_Bomtoon_Profile"
     file_ext = ".jpg"
+
+    # ----- login helpers -----
+    @staticmethod
+    def _find_password_input(driver):
+        for sel in ["input[type='password']", "input[name='password']"]:
+            for el in driver.find_elements(By.CSS_SELECTOR, sel):
+                try:
+                    if el.is_displayed() and el.is_enabled():
+                        return el
+                except Exception:
+                    continue
+        return None
+
+    @staticmethod
+    def _find_id_input(driver):
+        for sel in [
+            "input[placeholder*='이메일']",
+            "input[name='loginId']",
+            "input[type='email']",
+            "input[name='email']",
+        ]:
+            for el in driver.find_elements(By.CSS_SELECTOR, sel):
+                try:
+                    if el.is_displayed() and el.is_enabled():
+                        return el
+                except Exception:
+                    continue
+        return None
+
+    def is_logged_in(self, driver) -> Optional[bool]:
+        """ตรวจสถานะ login แบบ passive (ไม่เปลี่ยนหน้า)
+
+        ใช้ตัวตรวจกลางก่อน (ปุ่ม 로그인/로그아웃/마이페이지) ถ้าไม่ชัดเจน
+        ค่อย fallback ดูจากช่อง password / การหลุดจากหน้า login
+        """
+        base = super().is_logged_in(driver)
+        if base is not None:
+            return base
+        try:
+            # เห็นช่อง password = ยังไม่ login (อยู่บนฟอร์ม login)
+            if self._find_password_input(driver) is not None:
+                return False
+        except Exception:
+            pass
+        # นอกนั้นไม่ชัวร์ → คืน None ให้ผู้ใช้ยืนยันเอง
+        # (ห้ามเดาว่า "หลุดจากหน้า login = login แล้ว" เพราะ login fail ก็ redirect ได้)
+        return None
 
     # ----- login -----
     def login(self, driver, username: str, password: str, ctx: DownloaderContext) -> bool:
         """Auto-login บน bomtoon. คืน True ถ้า login สำเร็จ/มี session อยู่แล้ว"""
         if not username or not password:
-            ctx.log("   ⚠️ ไม่มี credentials — ข้าม login")
-            return True
+            ctx.log("   ⚠️ ไม่มี credentials — ข้าม auto-login (ให้ผู้ใช้ login เอง)")
+            return False
         try:
             driver.get(LOGIN_URL)
         except Exception as e:
@@ -72,27 +122,8 @@ class BomtoonDownloader(BaseDownloader):
             ctx.log("   ✅ session อยู่แล้ว ไม่ต้อง login")
             return True
 
-        id_input = None
-        pw_input = None
-        for sel in [
-            "input[placeholder*='이메일']",
-            "input[name='loginId']",
-            "input[type='email']",
-            "input[name='email']",
-        ]:
-            for el in driver.find_elements(By.CSS_SELECTOR, sel):
-                if el.is_displayed() and el.is_enabled():
-                    id_input = el
-                    break
-            if id_input:
-                break
-        for sel in ["input[type='password']", "input[name='password']"]:
-            for el in driver.find_elements(By.CSS_SELECTOR, sel):
-                if el.is_displayed() and el.is_enabled():
-                    pw_input = el
-                    break
-            if pw_input:
-                break
+        id_input = self._find_id_input(driver)
+        pw_input = self._find_password_input(driver)
 
         if not (id_input and pw_input):
             ctx.log("   ❌ หาฟอร์ม login ไม่เจอ")
@@ -279,19 +310,63 @@ class BomtoonDownloader(BaseDownloader):
         return count
 
     # ----- next -----
+    #
+    # ปุ่ม "다음화" (ตอนถัดไป) ของ Bomtoon เป็น React <div> ไม่ใช่ <button>/<a>
+    # โครงสร้างจริง (จากหน้า viewer):
+    #   <div class="sc-eVQfli kvLyqP">            ← ตัว control (มี onClick)
+    #     <div class="sc-eFWqGp kTJXXc"><svg/></div>
+    #     <div class="sc-kTvvXX fscKCH">다음화</div>  ← text node (leaf)
+    #   </div>
+    # วิธีที่ชัวร์สุดคือคลิกที่ "leaf" ที่มี text ตรงป้าย แล้วปล่อยให้ event
+    # bubble ขึ้นไปหา onClick ของ React (อยู่ที่ตัว control หรือสูงกว่า)
+    _NEXT_JS = r"""
+    () => {
+      const NEXT = ['다음화','다음 화','다음','ตอนต่อไป','ตอนถัดไป','ถัดไป','Next','NEXT','next'];
+      const norm = s => (s || '').replace(/\s+/g, ' ').trim();
+      const nodes = Array.from(document.querySelectorAll('div,button,a,span'));
+      const matches = nodes.filter(el => NEXT.includes(norm(el.textContent)));
+      // เก็บเฉพาะ node ที่ "ลึกสุด" (ไม่มี match ซ้อนข้างใน) = ตัว text node จริง
+      const leaves = matches.filter(el => !matches.some(o => o !== el && el.contains(o)));
+      if (!leaves.length) return null;
+      const leaf = leaves[0];
+      // ปุ่มถูกปิด? เช็คตัวเอง+ทุก ancestor (closest) เพราะ aria-disabled/disabled
+      // มักอยู่ที่ตัว wrapper ไม่ใช่ leaf — และ pointerEvents เช็คที่ leaf ได้เลย
+      // (เป็น inherited property) ห้ามใช้ cursor:pointer มาเดา wrapper เพราะ
+      // cursor ก็ inherit ลงมาที่ leaf เหมือนกัน
+      if (leaf.closest('[aria-disabled="true"], [disabled]') ||
+          getComputedStyle(leaf).pointerEvents === 'none') {
+        return 'disabled';
+      }
+      leaf.scrollIntoView({block: 'center'});
+      leaf.click();                 // ปล่อยให้ bubble ขึ้นไปหา onClick ของ React
+      return 'clicked';
+    }
+    """
+
     def click_next(self, driver, ctx: DownloaderContext) -> bool:
+        # 1) วิธีหลัก: หา <div> ปุ่ม next ด้วย JS (รองรับ React div-button)
+        try:
+            result = driver.execute_script("return (" + self._NEXT_JS + ")();")
+        except Exception as e:
+            ctx.log(f"   ⚠️ next(JS) error: {e}")
+            result = None
+        if result == "clicked":
+            ctx.log("   - 🖱️ คลิก Next (다음화)")
+            return True
+        if result == "disabled":
+            ctx.log("   - 🛑 ปุ่ม Next ถูกปิด (น่าจะเป็นตอนสุดท้าย)")
+            return False
+
+        # 2) fallback: <button>/<a> แบบเดิม (เผื่อ layout เปลี่ยน)
         candidates = [
-            # เกาหลี (เว็บใช้ภาษาเกาหลี)
             "//button[contains(., '다음화')]",
             "//a[contains(., '다음화')]",
             "//button[contains(., '다음')]",
             "//a[contains(., '다음')]",
-            # ไทย
             "//button[contains(., 'ตอนต่อไป')]",
             "//a[contains(., 'ตอนต่อไป')]",
             "//button[contains(., 'ตอนถัดไป')]",
             "//a[contains(., 'ตอนถัดไป')]",
-            # อังกฤษ
             "//button[contains(., 'Next')]",
             "//a[contains(., 'Next')]",
         ]
@@ -306,7 +381,7 @@ class BomtoonDownloader(BaseDownloader):
                 )
                 time.sleep(0.3)
                 driver.execute_script("arguments[0].click();", btn)
-                ctx.log("   - 🖱️ คลิก Next")
+                ctx.log("   - 🖱️ คลิก Next (fallback)")
                 return True
             except Exception:
                 continue

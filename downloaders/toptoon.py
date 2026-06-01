@@ -24,6 +24,7 @@ from .base import (
 class ToptoonDownloader(BaseDownloader):
     name = "Toptoon"
     url = "https://toptoon.com"
+    login_url = "https://toptoon.com/alert/auth/login"
     profile_dir = "Chrome_Toptoon_Profile"
     file_ext = ".jpg"
 

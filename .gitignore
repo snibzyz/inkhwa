@@ -10,6 +10,10 @@ env/
 # Chrome profiles (มี cookie ส่วนตัว ห้ามขึ้น git)
 profiles/
 
+# Auto-update artifacts (สร้างตอนอัปเดต)
+*.bak
+.update_staging/
+
 # Local data (login history, saved logs)
 .login_history.json
 inkhwa-log-*.txt

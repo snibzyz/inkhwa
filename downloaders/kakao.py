@@ -25,8 +25,13 @@ from .base import (
 class KakaoDownloader(BaseDownloader):
     name = "Kakao"
     url = "https://page.kakao.com"
+    # Kakao ใช้ SSO ที่ accounts.kakao.com แล้ว redirect กลับ page.kakao.com
+    login_url = "https://accounts.kakao.com/login/?continue=https%3A%2F%2Fpage.kakao.com"
     profile_dir = "Chrome_Kakao_Profile"
     file_ext = ".jpeg"
+    # cookie token ของ Kakao web login (มีเมื่อ login บัญชี Kakao แล้วเท่านั้น)
+    # ใช้เป็นสัญญาณ positive เพื่อให้ตรวจ login ได้แม้หน้าเป็น SPA
+    login_cookies = ("_kawlt", "_kawltea")
 
     def get_chapter_name(self, driver) -> str:
         # ใช้ส่วนท้าย URL เป็นชื่อตอน

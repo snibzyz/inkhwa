@@ -7,11 +7,63 @@ from __future__ import annotations
 import os
 import re
 import time
+import json
 import shutil
 import requests
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 from urllib.parse import urlparse
+
+# ค่าที่ใช้บอกว่า "ตรวจสถานะ login ไม่ได้" (ต่างจาก True/False ที่ชัดเจน)
+LOGIN_UNKNOWN = None
+
+# ป้ายปุ่ม "เข้าสู่ระบบ" หลายภาษา (เจอ = ยังไม่ login)
+LOGIN_LABELS = [
+    "로그인", "로그인하기", "ログイン", "登录", "登入",
+    "login", "log in", "sign in", "signin",
+    "เข้าสู่ระบบ", "ล็อกอิน", "ล็อกอิน/สมัครสมาชิก",
+]
+# ป้ายที่จะโผล่ "เฉพาะตอน login แล้ว" (เจอ = login แล้ว)
+# ใช้เฉพาะคำที่ "ชัดเจนว่า logout" เท่านั้น — ห้ามใส่คำเมนูทั่วไป (마이/마이페이지/보관함)
+# เพราะคำพวกนั้นโผล่บนหน้า "ก่อน login" ได้ → จะทำให้เดาว่า login แล้วผิด ๆ แล้วข้าม gate
+LOGGEDIN_LABELS = [
+    "로그아웃", "로그 아웃", "ログアウト", "登出", "退出登录",
+    "logout", "log out", "sign out", "signout",
+    "ออกจากระบบ",
+]
+
+# JS ตรวจสถานะ login แบบ passive (ไม่เปลี่ยนหน้า) — คืน flags ให้ฝั่ง Python ตัดสิน
+_LOGIN_DETECT_JS_TMPL = r"""
+() => {
+  const LOGIN = %s;
+  const OUT = %s;
+  const norm = s => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+  // ไม่ใช้ offsetParent (จะ null สำหรับ position:fixed → พลาด header แบบ fixed)
+  const visible = el => {
+    try {
+      const r = el.getBoundingClientRect();
+      if (!(r.width > 0 && r.height > 0)) return false;
+      const cs = getComputedStyle(el);
+      return cs.visibility !== 'hidden' && cs.display !== 'none' && cs.opacity !== '0';
+    } catch (e) { return false; }
+  };
+  // มีช่อง password ที่มองเห็น = อยู่บนฟอร์ม login
+  const hasPassword = Array.from(document.querySelectorAll("input[type='password']"))
+      .some(visible);
+  let hasLogin = false, hasLogout = false;
+  const nodes = document.querySelectorAll("a,button,[role='button'],span,div,li");
+  for (const el of nodes) {
+    if (!visible(el)) continue;
+    const t = norm(el.textContent);
+    if (!t || t.length > 24) continue;
+    // ตรงตัวเป๊ะเท่านั้น (ทั้ง logout/login) — กัน substring ของคำสั้น ๆ ทำให้เดาผิด
+    if (OUT.some(x => t === x)) hasLogout = true;
+    if (LOGIN.some(x => t === x)) hasLogin = true;
+    if (hasLogin && hasLogout) break;
+  }
+  return { hasPassword, hasLogin, hasLogout };
+}
+"""
 
 # undetected-chromedriver
 try:
@@ -226,6 +278,16 @@ class BaseDownloader:
     profile_dir: str = "Chrome_Profile"
     file_ext: str = ".jpg"
 
+    # หน้าที่ควรเปิดให้ผู้ใช้ login (default = หน้าแรกของเว็บ)
+    # subclass ที่มีหน้า login เฉพาะให้ override เป็น URL หน้า login ตรง ๆ
+    login_url: str = ""
+
+    # ชื่อ cookie ที่จะมี "หลัง login" (ใช้เป็นสัญญาณ login แล้วแบบ positive)
+    login_cookies: tuple[str, ...] = ()
+    # ป้ายเพิ่มเติมเฉพาะเว็บ (เสริมจากค่ากลาง) — login button / logged-in marker
+    extra_login_labels: tuple[str, ...] = ()
+    extra_loggedin_labels: tuple[str, ...] = ()
+
     # --------- ที่ต้อง override ---------
     def get_chapter_name(self, driver) -> str:
         return sanitize_filename(driver.title)
@@ -236,10 +298,75 @@ class BaseDownloader:
     def click_next(self, driver, ctx: DownloaderContext) -> bool:
         raise NotImplementedError
 
+    # --------- หน้า login ที่ควรเปิดให้ผู้ใช้ ---------
+    def get_login_url(self) -> str:
+        """URL ที่จะเปิดให้ผู้ใช้ login (default = หน้าแรกของเว็บ)"""
+        return self.login_url or self.url
+
     # --------- optional override: auto-login ---------
     def login(self, driver, username: str, password: str, ctx: DownloaderContext) -> bool:
         """Default: ไม่ทำ auto-login (ผู้ใช้ login เองในหน้าต่าง browser)"""
         return True
+
+    # --------- ตรวจสถานะ login (generic — ทุกเว็บใช้ได้) ---------
+    def _login_cookie_present(self, driver) -> bool:
+        if not self.login_cookies:
+            return False
+        try:
+            names = {c.get("name") for c in driver.get_cookies() if c.get("value")}
+            return any(n in names for n in self.login_cookies)
+        except Exception:
+            return False
+
+    def _detect_login_flags(self, driver) -> Optional[dict]:
+        """รัน JS ตรวจ flags: hasPassword / hasLogin / hasLogout"""
+        login_labels = [s.lower() for s in (list(LOGIN_LABELS) + list(self.extra_login_labels))]
+        out_labels = [s.lower() for s in (list(LOGGEDIN_LABELS) + list(self.extra_loggedin_labels))]
+        js = _LOGIN_DETECT_JS_TMPL % (json.dumps(login_labels), json.dumps(out_labels))
+        try:
+            return driver.execute_script("return (" + js + ")();")
+        except Exception:
+            return None
+
+    def is_logged_in(self, driver) -> Optional[bool]:
+        """ตรวจว่า login แล้วหรือยัง (passive — ไม่เปลี่ยนหน้า)
+
+        คืน:
+          True  = login แล้วแน่นอน
+          False = ยังไม่ login แน่นอน
+          None  = ตรวจไม่ได้ (ให้ worker รอผู้ใช้กด OK เอง)
+
+        หลักการ (เรียงตามความน่าเชื่อถือ):
+          1) มี cookie login → True
+          2) มีช่อง password โผล่ → False (อยู่บนฟอร์ม login)
+          3) เจอปุ่ม logout/มายเพจ และไม่เจอปุ่ม login → True
+          4) เจอปุ่ม login และไม่เจอ logout → False
+          5) อื่น ๆ → None
+        """
+        if self._login_cookie_present(driver):
+            return True
+        flags = self._detect_login_flags(driver)
+        if not flags:
+            # JS ใช้ไม่ได้ — ลองดูจาก host ของหน้า login เป็นทางสุดท้าย
+            # เทียบ host (ไม่ใช่ substring) เพราะ SSO เช่น Kakao จะ rewrite query
+            try:
+                lu = self.get_login_url()
+                if lu:
+                    cur_host = urlparse(driver.current_url or "").netloc
+                    if cur_host and cur_host == urlparse(lu).netloc:
+                        return False
+            except Exception:
+                pass
+            return LOGIN_UNKNOWN
+        if flags.get("hasPassword"):
+            return False
+        has_login = bool(flags.get("hasLogin"))
+        has_logout = bool(flags.get("hasLogout"))
+        if has_logout and not has_login:
+            return True
+        if has_login and not has_logout:
+            return False
+        return LOGIN_UNKNOWN
 
     # --------- ลูปกลาง (เรียกจาก worker) ---------
     def run_loop(self, driver, base_save_path: str, ctx: DownloaderContext) -> None:

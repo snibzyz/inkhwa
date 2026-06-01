@@ -4,6 +4,7 @@ from __future__ import annotations
 import os
 import sys
 import time
+import webbrowser
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -23,13 +24,19 @@ from .styles import (
     log_style, primary_button_style, danger_button_style, secondary_button_style,
 )
 from .worker import DownloadWorker
+from .version import __version__, REPO_URL
+from .updater import UpdateChecker, apply_update
 
 
 class ManhwaDownloaderGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.worker: DownloadWorker | None = None
+        self._login_box: QMessageBox | None = None
+        self._login_cancel_btn = None
+        self.update_checker: UpdateChecker | None = None
         self._init_ui()
+        self._start_update_check()
 
     # ----------------- UI -----------------
     def _init_ui(self):
@@ -97,6 +104,15 @@ class ManhwaDownloaderGUI(QMainWindow):
         lay.addWidget(subtitle)
 
         lay.addStretch()
+
+        self.version_label = QLabel(f"v{__version__}")
+        self.version_label.setStyleSheet(
+            f"color: {COLOR_TEXT_DIM}; font-size: 9pt;"
+            f"background: {COLOR_SURFACE}; border: 1px solid {COLOR_BORDER};"
+            "padding: 6px 12px; border-radius: 12px;"
+        )
+        self.version_label.setToolTip(f"Inkhwa v{__version__}\n{REPO_URL}")
+        lay.addWidget(self.version_label)
 
         sites_badge = QLabel(" · ".join(list_sites()))
         sites_badge.setStyleSheet(
@@ -348,6 +364,8 @@ class ManhwaDownloaderGUI(QMainWindow):
         self.worker.log_signal.connect(self._log)
         self.worker.progress_signal.connect(self._on_progress)
         self.worker.finished_signal.connect(self._on_finished)
+        self.worker.login_prompt_signal.connect(self._on_login_prompt)
+        self.worker.login_close_signal.connect(self._on_login_close)
         self.worker.start()
         self.statusBar().showMessage(f"🚀 Downloading from {site}...")
 
@@ -364,6 +382,10 @@ class ManhwaDownloaderGUI(QMainWindow):
             self.statusBar().showMessage(f"📥 {cur}/{total} images")
 
     def _on_finished(self, ok: bool, msg: str):
+        # ปิด popup login ถ้ายังค้างอยู่
+        if self._login_box is not None:
+            self._login_box.done(0)
+            self._login_box = None
         self.start_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.progress_bar.setVisible(False)
@@ -373,6 +395,103 @@ class ManhwaDownloaderGUI(QMainWindow):
         else:
             QMessageBox.warning(self, "Error", msg)
         self.worker = None
+
+    # ----------------- login popup -----------------
+    def _on_login_prompt(self, message: str):
+        """worker ขอให้ผู้ใช้ login แล้วกด OK"""
+        if self._login_box is not None:
+            return
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("รอ Login — Inkhwa")
+        box.setText(message)
+        ok_btn = box.addButton("OK — เริ่มดาวน์โหลด", QMessageBox.ButtonRole.AcceptRole)
+        cancel_btn = box.addButton("ยกเลิก", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(ok_btn)
+        self._login_box = box
+        self._login_cancel_btn = cancel_btn
+        box.finished.connect(self._on_login_finished)
+        # ไม่บล็อก GUI — ผู้ใช้ยังสลับไปหน้าต่าง Chrome เพื่อ login ได้
+        box.open()
+        self.statusBar().showMessage("⏳ รอ Login ในหน้าต่าง Chrome...")
+
+    def _on_login_finished(self, _result: int):
+        box = self._login_box
+        self._login_box = None
+        if box is None or self.worker is None:
+            return
+        clicked = box.clickedButton()
+        if clicked is not None and clicked is self._login_cancel_btn:
+            # ผู้ใช้กดยกเลิก → หยุดงาน
+            self.worker.stop()
+            self._log("⏹ ยกเลิกตอนรอ login")
+        else:
+            # กด OK หรือถูกปิดอัตโนมัติ (ตรวจพบว่า login แล้ว) → ไปต่อ
+            self.worker.confirm_login()
+
+    def _on_login_close(self):
+        """worker ตรวจพบว่า login สำเร็จเอง → ปิด popup ให้อัตโนมัติ"""
+        if self._login_box is not None:
+            self._login_box.done(0)
+
+    # ----------------- auto-update -----------------
+    def _start_update_check(self):
+        try:
+            self.update_checker = UpdateChecker()
+            self.update_checker.update_available.connect(self._on_update_available)
+            self.update_checker.up_to_date.connect(
+                lambda: self.statusBar().showMessage(
+                    f"✅ Inkhwa v{__version__} (ล่าสุดแล้ว)", 5000
+                )
+            )
+            self.update_checker.check_failed.connect(
+                lambda m: self.statusBar().showMessage(f"ℹ️ {m}", 5000)
+            )
+            self.update_checker.start()
+        except Exception:
+            # อัปเดตเป็นฟีเจอร์เสริม — พังก็ไม่กระทบการใช้งาน
+            pass
+
+    def _on_update_available(self, latest: str, notes: str):
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Icon.Information)
+        box.setWindowTitle("มีเวอร์ชันใหม่ — Inkhwa")
+        body = (
+            f"พบเวอร์ชันใหม่: v{latest}\n"
+            f"เวอร์ชันปัจจุบัน: v{__version__}\n\n"
+        )
+        if notes:
+            body += f"{notes}\n\n"
+        body += "ต้องการอัปเดตเดี๋ยวนี้ไหม?"
+        box.setText(body)
+        update_btn = box.addButton("อัปเดต", QMessageBox.ButtonRole.AcceptRole)
+        later_btn = box.addButton("ไว้ทีหลัง", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(update_btn)
+        box.exec()
+        if box.clickedButton() is update_btn:
+            self._run_update()
+        else:
+            self.version_label.setText(f"v{__version__} ⬆")
+            self.version_label.setToolTip(f"มีเวอร์ชันใหม่ v{latest} — คลิกที่ {REPO_URL}")
+
+    def _run_update(self):
+        self._log("⬇️ กำลังอัปเดต...")
+        ok, message = apply_update(self._log)
+        if ok:
+            QMessageBox.information(
+                self, "อัปเดตสำเร็จ",
+                message + "\n\nกรุณาปิดแล้วเปิดโปรแกรมใหม่เพื่อใช้เวอร์ชันล่าสุด",
+            )
+        else:
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Icon.Warning)
+            box.setWindowTitle("อัปเดตไม่สำเร็จ")
+            box.setText(message + f"\n\nดาวน์โหลดเองได้ที่:\n{REPO_URL}")
+            open_btn = box.addButton("เปิดหน้าเว็บ", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton("ปิด", QMessageBox.ButtonRole.RejectRole)
+            box.exec()
+            if box.clickedButton() is open_btn:
+                webbrowser.open(REPO_URL)
 
 
 # =========================================================================

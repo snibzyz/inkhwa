@@ -19,6 +19,7 @@ from .base import (
 class LezhinDownloader(BaseDownloader):
     name = "Lezhin"
     url = "https://www.lezhin.com/ko"
+    login_url = "https://www.lezhin.com/ko/login"
     profile_dir = "Chrome_Lezhin_Profile"
     file_ext = ".png"
 

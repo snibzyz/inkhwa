@@ -22,6 +22,7 @@ from .base import (
 class RidiDownloader(BaseDownloader):
     name = "RidiBooks"
     url = "https://ridibooks.com/"
+    login_url = "https://ridibooks.com/account/login"
     profile_dir = "Chrome_Ridi_Profile"
     file_ext = ".jpg"
 
