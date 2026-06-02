@@ -31,27 +31,38 @@ class LezhinDownloader(BaseDownloader):
         except Exception:
             return f"Lezhin_{int(time.time())}"
 
+    # selector กล่องภาพ (ไล่ตามลำดับ เอาตัวแรกที่เจอ)
+    _CONTAINER_SELECTORS = (
+        "div[class*='scrollViewCut']",
+        "div[class*='viewer']",
+        "div[class*='comic']",
+    )
+
+    def _collect_containers(self, driver):
+        """คืน list<WebElement> กล่องภาพล่าสุด (ไล่ selector เอาตัวแรกที่เจอ)"""
+        for sel in self._CONTAINER_SELECTORS:
+            try:
+                found = driver.find_elements(By.CSS_SELECTOR, sel)
+                if found:
+                    return found
+            except Exception:
+                continue
+        return []
+
     def download_chapter(self, driver, save_path, ctx: DownloaderContext) -> int:
         ctx.log("   - 🎯 เริ่มดาวน์โหลด (Canvas/IMG hybrid)")
         time.sleep(2)
 
-        containers = []
-        for sel in [
-            "div[class*='scrollViewCut']",
-            "div[class*='viewer']",
-            "div[class*='comic']",
-        ]:
-            found = driver.find_elements(By.CSS_SELECTOR, sel)
-            if found:
-                containers = found
-                ctx.log(f"   🔍 เจอด้วย {sel}: {len(found)} กล่อง")
-                break
-
+        # ✅ verify: เลื่อนหน้าโหลด lazy ให้กล่องภาพมาครบก่อน (กันเน็ตช้า → ได้ไม่ครบ)
+        containers = self.wait_count_stable(
+            driver, ctx, self._collect_containers, label="กล่องภาพ"
+        )
         if not containers:
             ctx.log("   ❌ ไม่พบกล่องภาพ")
             return 0
 
         total = len(containers)
+        ctx.log(f"   - 📦 พบ {total} กล่อง (ยืนยันโหลดครบแล้ว)")
         count = 0
         for index, container in enumerate(containers):
             if not ctx.is_running():
@@ -69,7 +80,8 @@ class LezhinDownloader(BaseDownloader):
                 time.sleep(0.5)
                 target = None
                 kind = None
-                for _ in range(15):
+                # เน็ตช้า: รอภาพในกล่อง 'โหลดเสร็จจริง' นานขึ้น (50×0.2 = 10s) แทนการข้ามทิ้ง
+                for _ in range(50):
                     if not ctx.is_running():
                         break
                     imgs = container.find_elements(By.TAG_NAME, "img")
@@ -89,6 +101,7 @@ class LezhinDownloader(BaseDownloader):
                     time.sleep(0.2)
 
                 if not target:
+                    ctx.log(f"      ❌ ข้าม #{index+1} (โหลดไม่ทัน)")
                     continue
 
                 if kind == "canvas":
@@ -114,6 +127,13 @@ class LezhinDownloader(BaseDownloader):
                     ctx.log(f"      ❌ Save Failed: {filename}")
             except Exception as e:
                 ctx.log(f"      ❌ Error #{index+1}: {e}")
+
+        if count < total:
+            ctx.log(
+                f"   - ⚠️ ได้ภาพไม่ครบ: {count}/{total} ใบ (เน็ตช้า) — แนะนำโหลดตอนนี้ซ้ำ"
+            )
+        else:
+            ctx.log(f"   - ✅ ครบทุกใบ: {count}/{total}")
         return count
 
     def click_next(self, driver, ctx: DownloaderContext) -> bool:

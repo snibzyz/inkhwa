@@ -347,13 +347,18 @@ const id = setInterval(() => {
         # ลบ SN อีกรอบ (กรณีมี element ใหม่หลัง scroll)
         self._strip_sn(driver, ctx)
 
-        images = self._collect_comic_imgs(driver)
+        # ✅ verify: รอให้ภาพ 'โหลดครบทุกใบ' ก่อนเริ่มดูด (กันเน็ตช้า → ได้ภาพไม่ครบ)
+        #    เน็ตช้า: <img> ที่ naturalWidth=0 จะถูก _collect_comic_imgs กรองทิ้งตอนนับ
+        images = self.wait_images_loaded(driver, ctx, self._collect_comic_imgs)
         if not images:
             ctx.log("   ❌ ไม่พบรูปภาพ (ต้องซื้อตอน?)")
             return 0
 
+        # ลบ SN อีกครั้งหลังโหลดครบ (กัน watermark ที่เพิ่งโผล่ตอนรูปโหลดเสร็จ)
+        self._strip_sn(driver, ctx)
+
         total = len(images)
-        ctx.log(f"   - 📦 พบ {total} รูป (canvas mode)")
+        ctx.log(f"   - 📦 พบ {total} รูป (ยืนยันโหลดครบแล้ว, canvas mode)")
 
         count = 0
         for index, img in enumerate(images):
@@ -383,7 +388,7 @@ const id = setInterval(() => {
                         "setTimeout(()=>window.scrollBy(0,50),100);"
                     )
                     start = time.time()
-                    while time.time() - start < 4:
+                    while time.time() - start < 10:   # เน็ตช้า: รอนานขึ้นแทนการข้ามทิ้ง
                         if not ctx.is_running():
                             break
                         time.sleep(0.4)
@@ -425,6 +430,14 @@ const id = setInterval(() => {
             except Exception as e:
                 ctx.log(f"      ⚠️ Error #{index+1}: {e}")
 
+        # สรุปความครบ — แจ้งชัดถ้าได้ไม่ครบ (เน็ตช้า) จะได้รู้ว่าควรโหลดตอนนี้ซ้ำ
+        if count < total:
+            ctx.log(
+                f"   - ⚠️ ได้ภาพไม่ครบ: {count}/{total} ใบ "
+                f"(เน็ตช้า/บางใบโหลดไม่ทัน) — แนะนำโหลดตอนนี้ซ้ำอีกครั้ง"
+            )
+        else:
+            ctx.log(f"   - ✅ ครบทุกใบ: {count}/{total}")
         return count
 
     # ----- next -----

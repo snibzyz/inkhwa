@@ -324,6 +324,83 @@ def download_url_to(session: requests.Session, url: str, dest: str, timeout: int
         return False
 
 
+def image_is_complete(path: str) -> bool:
+    """ตรวจ 'ท้ายไฟล์ภาพ' ว่าโหลดมาครบจริงไหม (กันภาพขาดครึ่งตอนเน็ตช้า/หลุด)
+
+    JPEG ต้องลงท้าย FFD9, PNG ต้องมี IEND, GIF ลงท้าย 0x3B
+    ชนิดที่ตรวจไม่เป็น (เช่น WebP) → ถือว่าผ่านถ้ามีขนาดพอควร (ไม่ฟันธงว่าเสีย)
+    """
+    try:
+        size = os.path.getsize(path)
+        if size < 100:
+            return False
+        with open(path, "rb") as f:
+            head = f.read(8)
+            f.seek(-16, os.SEEK_END)
+            tail = f.read(16)
+        if head[:2] == b"\xff\xd8":                         # JPEG
+            return tail.rstrip(b"\x00")[-2:] == b"\xff\xd9"
+        if head[:8] == b"\x89PNG\r\n\x1a\n":                 # PNG
+            return b"IEND" in tail
+        if head[:3] == b"GIF":                               # GIF
+            return tail.rstrip(b"\x00")[-1:] == b"\x3b"
+        return True                                          # WebP/อื่น ๆ — ตรวจไม่เป็น
+    except Exception:
+        return True
+
+
+def download_url_verified(
+    session: requests.Session,
+    url: str,
+    dest: str,
+    timeout: int = 30,
+    retries: int = 3,
+    log: Optional[Callable[[str], None]] = None,
+) -> bool:
+    """ดาวน์โหลดรูป + 'ยืนยันว่าได้ครบ' (เทียบ Content-Length + ตรวจท้ายไฟล์)
+
+    ถ้าไม่ครบ/พังกลางคัน จะลบไฟล์เสียทิ้งแล้วลองใหม่ (เน็ตช้าได้บ่อย)
+    คืน True เฉพาะเมื่อได้ไฟล์ภาพครบสมบูรณ์จริง ๆ เท่านั้น
+    """
+    last_err = ""
+    for attempt in range(1, retries + 1):
+        try:
+            r = session.get(url, stream=True, timeout=timeout)
+            if r.status_code != 200:
+                last_err = f"HTTP {r.status_code}"
+            else:
+                clen = r.headers.get("Content-Length")
+                expected = int(clen) if (clen and clen.isdigit()) else None
+                written = 0
+                with open(dest, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=65536):
+                        if chunk:
+                            f.write(chunk)
+                            written += len(chunk)
+                if written == 0:
+                    last_err = "ได้ 0 ไบต์"
+                elif expected is not None and written < expected:
+                    last_err = f"ไม่ครบ {written}/{expected}B"
+                elif not image_is_complete(dest):
+                    last_err = "ภาพไม่สมบูรณ์ (ขาดท้ายไฟล์)"
+                else:
+                    return True
+        except Exception as e:
+            last_err = str(e)
+        if log and attempt < retries:
+            log(f"      ↻ โหลดไม่ครบ ลองใหม่ ({attempt}/{retries}) — {last_err}")
+        time.sleep(min(3.0, 0.8 * attempt))
+    # ลบไฟล์เสียทิ้ง กันเข้าใจผิดว่าโหลดสำเร็จ (มี size > 0 แต่ภาพขาด)
+    try:
+        if os.path.exists(dest):
+            os.remove(dest)
+    except Exception:
+        pass
+    if log:
+        log(f"      ❌ โหลดไม่สำเร็จหลังลอง {retries} ครั้ง — {last_err}")
+    return False
+
+
 # =========================================================================
 # Base Downloader
 # =========================================================================
@@ -460,6 +537,167 @@ class BaseDownloader:
         if has_login and not has_logout:
             return False
         return LOGIN_UNKNOWN
+
+    # --------- ยืนยันภาพโหลดครบ (shared — เว็บแบบ canvas/blob ใช้ร่วมกัน) ---------
+    # JS: รับ list<img> แล้วคืน array ว่าแต่ละใบ 'โหลดเสร็จจริง' ไหม
+    # (complete && naturalWidth>0 = ภาพถูก decode เต็มใบแล้ว วาดลง canvas ได้ครบ)
+    _IMG_READY_STATES_JS = r"""
+const imgs = arguments[0] || [];
+return imgs.map(i => {
+  try { return !!(i && i.complete && i.naturalWidth > 0); }
+  catch (e) { return false; }
+});
+"""
+
+    @staticmethod
+    def _img_ready_states(driver, images):
+        """คืน list<bool> สถานะโหลดเสร็จของแต่ละ img — None ถ้า element หลุด (stale)"""
+        if not images:
+            return []
+        try:
+            return driver.execute_script(BaseDownloader._IMG_READY_STATES_JS, images)
+        except Exception:
+            return None
+
+    def wait_images_loaded(
+        self,
+        driver,
+        ctx: "DownloaderContext",
+        collect,
+        *,
+        min_count: int = 1,
+        overall_timeout: float = 180.0,
+        zero_grace: float = 12.0,
+    ):
+        """รอ + ยืนยันว่า <img> การ์ตูน 'โหลดครบทุกใบ' ก่อนเริ่มดูด (กันเน็ตช้า)
+
+        เน็ตช้าทำให้ <img> บางใบยังโหลดไม่เสร็จ (naturalWidth=0) → ถ้าดูดเลยจะ
+        ได้ภาพไม่ครบ/canvas เปล่า บางเว็บยังถูกกรองทิ้งตอน 'นับ' ด้วย จึงต้องรอ
+        ให้ครบก่อน
+
+        collect: callable(driver) -> list<WebElement>  (รูปการ์ตูนล่าสุดบนหน้า)
+        เงื่อนไข 'ครบ' = จำนวนรูปนิ่ง (lazy ไม่เพิ่มแล้ว) + ทุกใบโหลดเสร็จ
+        คืน list<WebElement> ล่าสุด (เอาไปดูดต่อได้เลย) — [] ถ้าไม่เจอรูปเลย
+        """
+        deadline = time.time() + overall_timeout
+        zero_deadline = time.time() + zero_grace
+        prev_total = -1
+        stable = 0
+        last: list = []
+        while time.time() < deadline:
+            if not ctx.is_running():
+                break
+            images = collect(driver) or []
+            last = images
+            total = len(images)
+            if total == 0:
+                # ยังไม่เจอรูปเลย — ให้เวลา grace แล้วเลื่อนปลุก lazy load
+                if time.time() > zero_deadline:
+                    return []
+                try:
+                    driver.execute_script(
+                        "window.scrollBy(0, Math.max(800, window.innerHeight));"
+                    )
+                except Exception:
+                    pass
+                time.sleep(1.0)
+                continue
+            states = self._img_ready_states(driver, images)
+            if states is None:          # element หลุด (stale) → ลองใหม่
+                time.sleep(0.5)
+                continue
+            ready = sum(1 for s in states if s)
+            ctx.progress(ready, total)
+            not_ready = [i for i, ok in enumerate(states) if not ok]
+            # ครบเมื่อ: ทุกใบโหลดเสร็จ + จำนวนนิ่งเท่ารอบก่อน (ยืนยัน 2 รอบกัน lazy เพิ่ม)
+            if not not_ready and total == prev_total and total >= min_count:
+                stable += 1
+                if stable >= 2:
+                    ctx.log(f"   - ✅ ยืนยันภาพครบ: {ready}/{total} ใบ พร้อมดูด")
+                    return images
+            else:
+                stable = 0
+            prev_total = total
+            if not_ready:
+                ctx.log(f"   - ⏳ รอภาพโหลด: พร้อม {ready}/{total} (เหลือ {len(not_ready)})")
+                # กระตุ้นโหลดรูปที่ยังไม่เสร็จ: เลื่อนไปหาทีละใบ
+                for idx in not_ready[:16]:
+                    try:
+                        driver.execute_script(
+                            "arguments[0].scrollIntoView({block:'center'});",
+                            images[idx],
+                        )
+                        time.sleep(0.1)
+                    except Exception:
+                        pass
+            else:
+                # โหลดครบที่เห็น แต่จำนวนยังไม่นิ่ง → เลื่อนลงหารูปเพิ่ม
+                try:
+                    driver.execute_script(
+                        "window.scrollBy(0, Math.max(800, window.innerHeight));"
+                    )
+                except Exception:
+                    pass
+            time.sleep(1.0)
+        # หมดเวลา — ดูดเท่าที่พร้อม + แจ้งเตือนชัด ๆ ว่าอาจไม่ครบ
+        states = self._img_ready_states(driver, last) or []
+        ready = sum(1 for s in states if s)
+        ctx.log(
+            f"   - ⚠️ โหลดไม่ครบในเวลาที่กำหนด: พร้อม {ready}/{len(last)} ใบ "
+            f"(เน็ตช้า) — จะดูดเท่าที่พร้อม"
+        )
+        return last
+
+    def wait_count_stable(
+        self,
+        driver,
+        ctx: "DownloaderContext",
+        collect,
+        *,
+        label: str = "รูป",
+        min_count: int = 1,
+        overall_timeout: float = 120.0,
+        zero_grace: float = 12.0,
+        stable_rounds: int = 3,
+    ):
+        """เลื่อนหน้าโหลด lazy + รอจน 'จำนวนที่เจอนิ่ง' (lazy โหลดมาครบไม่เพิ่มแล้ว)
+
+        ใช้กับเว็บที่นับจาก element/URL ใน DOM (ไม่ใช่ canvas) เช่น Kakao/Toptoon/
+        Lezhin — กันเน็ตช้าแล้วเก็บ <img> มาไม่ครบเพราะ lazy ยังโหลดไม่หมด
+        คืน list ล่าสุดที่ collect ได้
+        """
+        deadline = time.time() + overall_timeout
+        zero_deadline = time.time() + zero_grace
+        prev = -1
+        stable = 0
+        last: list = []
+        while time.time() < deadline:
+            if not ctx.is_running():
+                break
+            items = collect(driver) or []
+            last = items
+            n = len(items)
+            if n == 0 and time.time() > zero_deadline:
+                return []
+            if n >= min_count and n == prev:
+                stable += 1
+                if stable >= stable_rounds:
+                    ctx.log(f"   - ✅ จำนวน{label}นิ่งแล้ว (โหลดครบ): {n}")
+                    return items
+            else:
+                stable = 0
+                if n != prev and n > 0:
+                    ctx.log(f"   - ⏳ กำลังโหลด{label}... พบ {n} (รอให้นิ่ง)")
+            prev = n
+            try:
+                driver.execute_script(
+                    "window.scrollBy(0, Math.max(1000, window.innerHeight));"
+                )
+            except Exception:
+                pass
+            time.sleep(0.8)
+        ctx.log(f"   - ⚠️ จำนวน{label}อาจยังไม่ครบ (เน็ตช้า): {len(last)}")
+        return last
 
     # --------- ลูปกลาง (เรียกจาก worker) ---------
     def run_loop(self, driver, base_save_path: str, ctx: DownloaderContext) -> None:

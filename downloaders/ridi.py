@@ -43,35 +43,45 @@ class RidiDownloader(BaseDownloader):
         except Exception:
             return f"Ridi_Unknown_{int(time.time())}"
 
+    # selector รูปการ์ตูน (ไล่ตามลำดับ เอาตัวแรกที่เจอ)
+    _IMG_SELECTORS = (
+        "img.wv-1ago99h",
+        "img[class*='wv-1ago99h']",
+        "img[src*='blob:']",
+    )
+
+    def _collect_imgs(self, driver):
+        """คืน list<WebElement> รูปการ์ตูนล่าสุดบนหน้า (ไล่ selector เอาตัวแรกที่เจอ)"""
+        for sel in self._IMG_SELECTORS:
+            try:
+                found = driver.find_elements(By.CSS_SELECTOR, sel)
+                if found:
+                    return found
+            except Exception:
+                continue
+        return []
+
     # -------- download --------
     def download_chapter(self, driver, save_path, ctx: DownloaderContext) -> int:
         ctx.log("   - 🎯 เริ่มดาวน์โหลด (Canvas mode)...")
         time.sleep(2)
 
-        images = []
-        selectors = [
-            "img.wv-1ago99h",
-            "img[class*='wv-1ago99h']",
-            "img[src*='blob:']",
-        ]
-        for sel in selectors:
-            try:
-                WebDriverWait(driver, 5).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, sel))
-                )
-                found = driver.find_elements(By.CSS_SELECTOR, sel)
-                if found:
-                    images = found
-                    ctx.log(f"   🔍 เจอด้วย selector: {sel} ({len(found)} รูป)")
-                    break
-            except Exception:
-                continue
+        # รอให้มีรูปโผล่ก่อน (อย่างน้อย 1 ใบ)
+        try:
+            WebDriverWait(driver, 8).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "img[src*='blob:']"))
+            )
+        except Exception:
+            pass
 
+        # ✅ verify: รอให้ภาพ 'โหลดครบทุกใบ' ก่อนเริ่มดูด (กันเน็ตช้า → ได้ภาพไม่ครบ)
+        images = self.wait_images_loaded(driver, ctx, self._collect_imgs)
         if not images:
             ctx.log("   ❌ ไม่พบรูปภาพ (Login แล้ว / เปิดหน้าตอนแล้ว?)")
             return 0
 
         total = len(images)
+        ctx.log(f"   - 📦 พบ {total} รูป (ยืนยันโหลดครบแล้ว)")
         count = 0
         for index, img in enumerate(images):
             if not ctx.is_running():
@@ -98,7 +108,7 @@ class RidiDownloader(BaseDownloader):
                         "setTimeout(()=>window.scrollBy(0,50),100);"
                     )
                     start = time.time()
-                    while time.time() - start < 4:
+                    while time.time() - start < 10:   # เน็ตช้า: รอนานขึ้นแทนการข้ามทิ้ง
                         if not ctx.is_running():
                             break
                         time.sleep(0.4)
@@ -139,6 +149,13 @@ class RidiDownloader(BaseDownloader):
                 ctx.log(f"      ⚠️ Element หลุด")
             except Exception as e:
                 ctx.log(f"      ⚠️ Error: {e}")
+
+        if count < total:
+            ctx.log(
+                f"   - ⚠️ ได้ภาพไม่ครบ: {count}/{total} ใบ (เน็ตช้า) — แนะนำโหลดตอนนี้ซ้ำ"
+            )
+        else:
+            ctx.log(f"   - ✅ ครบทุกใบ: {count}/{total}")
         return count
 
     # -------- next --------

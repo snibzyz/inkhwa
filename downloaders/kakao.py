@@ -4,7 +4,6 @@ from __future__ import annotations
 import os
 import time
 
-from bs4 import BeautifulSoup
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -17,7 +16,7 @@ from .base import (
     register_downloader,
     sanitize_filename,
     make_requests_session,
-    download_url_to,
+    download_url_verified,
 )
 
 
@@ -42,6 +41,60 @@ class KakaoDownloader(BaseDownloader):
         except Exception:
             return f"Kakao_{int(time.time())}"
 
+    def _collect_all_image_urls(
+        self, driver, ctx: DownloaderContext, overall_timeout: float = 120.0
+    ) -> list:
+        """เลื่อนหน้าทีละช่วง + เก็บ URL รูปสะสม จน 'ไม่มี URL ใหม่' ติดกัน 3 รอบ
+
+        เก็บแบบสะสม (set) กัน viewer virtualize ถอด <img> เก่าทิ้ง → ได้รูปครบทุกใบ
+        คืน list URL ตามลำดับที่พบ
+        """
+        urls: list = []
+        seen: set = set()
+        deadline = time.time() + overall_timeout
+        stable = 0
+
+        def grab():
+            new = 0
+            try:
+                els = driver.find_elements(
+                    By.CSS_SELECTOR, "img[src*='page-edge.kakao.com']"
+                )
+            except Exception:
+                els = []
+            for el in els:
+                try:
+                    src = el.get_attribute("src")
+                except Exception:
+                    continue
+                if src and "page-edge.kakao.com" in src and src not in seen:
+                    seen.add(src)
+                    urls.append(src)
+                    new += 1
+            return new
+
+        while time.time() < deadline and ctx.is_running():
+            new = grab()
+            if new == 0 and urls:
+                stable += 1
+                if stable >= 3:          # ไม่มีรูปใหม่ติดกัน 3 รอบ = ครบแล้ว
+                    break
+            else:
+                stable = 0
+                if new:
+                    ctx.log(f"   - ⏳ เก็บรูปแล้ว {len(urls)} ใบ (เลื่อนหาเพิ่ม...)")
+            try:
+                driver.execute_script(
+                    "window.scrollBy(0, Math.max(1000, window.innerHeight));"
+                )
+            except Exception:
+                pass
+            time.sleep(0.8)
+
+        if urls:
+            ctx.log(f"   - ✅ รวบรวม URL รูปครบ: {len(urls)} ใบ")
+        return urls
+
     def download_chapter(self, driver, save_path, ctx: DownloaderContext) -> int:
         ctx.log("   - 🎯 เริ่มดาวน์โหลด (URL mode)")
         try:
@@ -54,16 +107,16 @@ class KakaoDownloader(BaseDownloader):
             ctx.log("   ❌ ไม่พบรูปภาพ (อาจต้องซื้อตอน)")
             return 0
 
-        html = driver.page_source
-        soup = BeautifulSoup(html, "html.parser")
-        image_tags = soup.find_all("img", src=lambda s: s and "page-edge.kakao.com" in s)
-        if not image_tags:
+        # ✅ verify: เลื่อนหน้าโหลด lazy + 'เก็บ URL สะสม' จนไม่มีรูปใหม่ (กันเน็ตช้า)
+        #    viewer Kakao อาจ virtualize (ถอด <img> ที่เลื่อนผ่านออกจาก DOM) จึงต้อง
+        #    เก็บสะสมระหว่างเลื่อน ไม่ใช่อ่าน DOM ครั้งเดียว เดี๋ยวได้รูปไม่ครบ
+        urls = self._collect_all_image_urls(driver, ctx)
+        if not urls:
             ctx.log("   ❌ ไม่พบรูปภาพ")
             return 0
 
-        urls = [img["src"] for img in image_tags]
         total = len(urls)
-        ctx.log(f"   - 📦 พบ {total} รูป")
+        ctx.log(f"   - 📦 พบ {total} รูป (ยืนยันโหลดครบแล้ว)")
         session = make_requests_session(driver)
 
         count = 0
@@ -75,12 +128,20 @@ class KakaoDownloader(BaseDownloader):
             if os.path.exists(fpath) and os.path.getsize(fpath) > 0:
                 count += 1
                 continue
-            if download_url_to(session, url, fpath, timeout=30):
+            # โหลดแบบ verified: เช็คครบ (Content-Length + ท้ายไฟล์) + ลองใหม่ถ้าขาด
+            if download_url_verified(session, url, fpath, timeout=30, log=ctx.log):
                 count += 1
                 ctx.log(f"      ✅ Save: {filename} [{count}/{total}]")
                 ctx.progress(count, total)
             else:
                 ctx.log(f"      ❌ Failed: {filename}")
+
+        if count < total:
+            ctx.log(
+                f"   - ⚠️ ได้ภาพไม่ครบ: {count}/{total} ใบ (เน็ตช้า) — แนะนำโหลดตอนนี้ซ้ำ"
+            )
+        else:
+            ctx.log(f"   - ✅ ครบทุกใบ: {count}/{total}")
         return count
 
     def click_next(self, driver, ctx: DownloaderContext) -> bool:

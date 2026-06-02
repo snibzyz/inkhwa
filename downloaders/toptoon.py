@@ -16,7 +16,7 @@ from .base import (
     register_downloader,
     sanitize_filename,
     make_requests_session,
-    download_url_to,
+    download_url_verified,
 )
 
 
@@ -40,16 +40,21 @@ class ToptoonDownloader(BaseDownloader):
             WebDriverWait(driver, 10).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, ".document_img"))
             )
-            images = driver.find_elements(By.CSS_SELECTOR, ".document_img")
         except TimeoutException:
-            images = []
+            ctx.log("   ❌ ไม่พบรูปภาพ (ต้องซื้อตอน?)")
+            return 0
 
+        # ✅ verify: เลื่อนหน้าโหลด lazy ให้ภาพมาครบก่อน (กันเน็ตช้า → เก็บ <img> ไม่ครบ)
+        images = self.wait_count_stable(
+            driver, ctx,
+            lambda d: d.find_elements(By.CSS_SELECTOR, ".document_img"),
+        )
         if not images:
             ctx.log("   ❌ ไม่พบรูปภาพ (ต้องซื้อตอน?)")
             return 0
 
         total = len(images)
-        ctx.log(f"   - 📦 พบ {total} รูป")
+        ctx.log(f"   - 📦 พบ {total} รูป (ยืนยันโหลดครบแล้ว)")
         session = make_requests_session(driver)
         count = 0
         for index, img in enumerate(images):
@@ -67,8 +72,10 @@ class ToptoonDownloader(BaseDownloader):
                 )
                 url = img.get_attribute("data-src") or img.get_attribute("src")
                 if not url:
+                    ctx.log(f"      ❌ ข้าม #{index+1} (ยังไม่มี URL รูป)")
                     continue
-                if download_url_to(session, url, fpath):
+                # โหลดแบบ verified: เช็คครบ (Content-Length + ท้ายไฟล์) + ลองใหม่ถ้าขาด
+                if download_url_verified(session, url, fpath, log=ctx.log):
                     count += 1
                     ctx.log(f"      ✅ Save: {filename} [{count}/{total}]")
                     ctx.progress(count, total)
@@ -76,6 +83,13 @@ class ToptoonDownloader(BaseDownloader):
                     ctx.log(f"      ❌ Load Failed: {filename}")
             except Exception as e:
                 ctx.log(f"      ❌ Error #{index+1}: {e}")
+
+        if count < total:
+            ctx.log(
+                f"   - ⚠️ ได้ภาพไม่ครบ: {count}/{total} ใบ (เน็ตช้า) — แนะนำโหลดตอนนี้ซ้ำ"
+            )
+        else:
+            ctx.log(f"   - ✅ ครบทุกใบ: {count}/{total}")
         return count
 
     def click_next(self, driver, ctx: DownloaderContext) -> bool:
