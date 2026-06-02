@@ -1,0 +1,5 @@
+# เครื่องมือ dev เท่านั้น (ไม่ใช้ตอน production — production ใช้ undetected-chromedriver)
+# ใช้กับ tools/probe_bomtoon_playwright.py สำหรับตรวจ/ออกแบบกลยุทธ์ดูดภาพ
+#   pip install -r requirements-dev.txt
+#   (ขับ Chrome จริงผ่าน channel="chrome" — ไม่ต้อง playwright install chromium)
+playwright>=1.58

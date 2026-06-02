@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import queue
 import threading
 import time
 from urllib.parse import urlparse
@@ -69,6 +70,9 @@ class DownloadWorker(QThread):
         self._url_event = threading.Event()
         self._provided_url: str = ""
         self._url_cancelled = False
+        # pipeline รวมภาพ: รวมตอนก่อนหน้าใน thread เบื้องหลัง ระหว่างโหลดตอนถัดไป
+        self._merge_queue: "queue.Queue" = queue.Queue()
+        self._merge_thread: threading.Thread | None = None
 
     # ------ control ------
     def stop(self):
@@ -179,12 +183,20 @@ class DownloadWorker(QThread):
             self.log("🔎 หน้า login ตรวจไม่ชัด (อาจว่างเพราะ login แล้ว) — เปิดหน้าหลักเช็คซ้ำ")
             try:
                 driver.get(downloader.url)
-                time.sleep(2)
             except Exception as e:
                 self.log(f"⚠️ เปิดหน้าหลักไม่ได้: {e}")
+            # poll เช็ค login เร็ว ๆ — เจอสถานะชัด (login cookie/ปุ่ม) เมื่อไรหยุดทันที
+            # (แทน sleep 2 วิ คงที่ → ปกติเจอ session ใน ~0.5 วิ)
+            deadline = time.time() + 4.0
+            while time.time() < deadline:
+                if not self.is_running:
+                    return False
+                state = _state()
+                if state is not None:
+                    break
+                time.sleep(0.3)
             self._track_page(driver, "หน้าหลัก")
             self._log_cookies(driver)
-            state = _state()
             if state is True:
                 self.log("✅ ตรวจพบว่า login อยู่แล้ว (จากหน้าหลัก) — ไปต่อได้เลย")
                 return True
@@ -285,25 +297,55 @@ class DownloadWorker(QThread):
         # เว้นว่าง = ใช้หน้าที่เปิดอยู่ตอนนี้ (run_loop จะเริ่มจากหน้าปัจจุบันเอง)
         return ""
 
-    # ------ hook หลังโหลดแต่ละตอน: auto-merge ------
+    # ------ pipeline รวมภาพ (รวมตอนก่อนหน้าใน background ขณะโหลดตอนถัดไป) ------
     def _after_chapter(self, save_path: str, saved: int):
-        if not self.merge_enabled or saved < 2:
+        """เรียกหลังโหลดแต่ละตอนเสร็จ — โยนเข้าคิวให้ thread เบื้องหลังรวม
+
+        ไม่บล็อก: การโหลดไปตอนถัดไปดำเนินต่อทันที ส่วนการรวมตอนนี้ทำขนานไป
+        (โหลดตอน N+1 + รวมตอน N พร้อมกัน → ลดเวลารวม)
+        """
+        if self.merge_enabled and saved >= 2:
+            self._merge_queue.put(save_path)
+
+    def _start_merge_worker(self):
+        """เริ่ม thread เบื้องหลังรวมภาพ (ทำทีละตอนตามคิว ขนานกับการโหลด)"""
+        if not self.merge_enabled or self._merge_thread is not None:
             return
-        # import แบบ lazy เผื่อ Pillow ไม่ได้ติดตั้ง
+        self._merge_thread = threading.Thread(target=self._merge_worker, daemon=True)
+        self._merge_thread.start()
+
+    def _merge_worker(self):
+        """ดึงโฟลเดอร์ตอนจากคิวมารวมทีละตอน (None = สัญญาณจบ)"""
         try:
             from .merge import merge_folder
         except Exception as e:
-            self.log(f"   ⚠️ รวมไฟล์อัตโนมัติไม่ได้ (import error): {e}")
+            self.log(f"⚠️ รวมไฟล์ไม่ได้ (import error): {e}")
+            while self._merge_queue.get() is not None:   # เคลียร์คิวกัน join ค้าง
+                pass
             return
         keep = self.merge_keep_original
-        self.log(f"   🧩 รวมไฟล์อัตโนมัติ (ทีละ {self.merge_group} รูป, "
-                 f"{'เก็บต้นฉบับ' if keep else 'ลบต้นฉบับ'})...")
-        try:
-            made, src = merge_folder(save_path, self.merge_group, keep, self.log)
-            if made:
-                self.log(f"   ✅ รวมเสร็จ: {src} รูป → {made} ไฟล์")
-        except Exception as e:
-            self.log(f"   ⚠️ รวมไฟล์ผิดพลาด: {e}")
+        while True:
+            save_path = self._merge_queue.get()
+            if save_path is None:           # สัญญาณจบ
+                break
+            name = os.path.basename(save_path)
+            try:
+                self.log(f"   🧩 (พื้นหลัง) รวมตอน {name} ...")
+                made, src = merge_folder(save_path, self.merge_group, keep, self.log)
+                if made:
+                    self.log(f"   ✅ รวมตอน {name} เสร็จ: {src} รูป → {made} ไฟล์")
+            except Exception as e:
+                self.log(f"   ⚠️ รวมตอน {name} ผิดพลาด: {e}")
+
+    def _finish_merges(self):
+        """ปิดคิว + รอ thread รวมตอนที่ค้างให้เสร็จ (เรียกหลังโหลดจบ)"""
+        if self._merge_thread is None:
+            return
+        if not self._merge_queue.empty() or self._merge_thread.is_alive():
+            self.log("⏳ รอรวมตอนที่ค้างให้เสร็จ...")
+        self._merge_queue.put(None)         # สัญญาณจบ
+        self._merge_thread.join()
+        self.log("✅ รวมไฟล์ครบทุกตอนแล้ว")
 
     # ------ main ------
     def run(self):
@@ -333,7 +375,7 @@ class DownloadWorker(QThread):
                 is_running=lambda: self.is_running,
                 folder_start=(self.start_number if self.number_folders else None),
                 folder_pad=self.pad,
-                after_chapter=self._after_chapter,
+                after_chapter=self._after_chapter,   # โยนตอนที่โหลดเสร็จเข้าคิวรวมเบื้องหลัง
             )
 
             # ---- รับประกัน login เสร็จ "ก่อน" ไปหน้าตอน ----
@@ -371,7 +413,16 @@ class DownloadWorker(QThread):
                 self.finished_signal.emit(False, "หยุดการทำงาน")
                 return
 
+            # เริ่ม thread รวมภาพเบื้องหลัง (จะรวมตอน N ระหว่างโหลดตอน N+1)
+            self._start_merge_worker()
+
             downloader.run_loop(driver, self.output_path, ctx)
+
+            # โหลดครบ/หยุดแล้ว — ปิด Chrome (ไม่ใช้ต่อ) แล้วรอรวมตอนที่ค้างให้จบ
+            if self.chrome:
+                self.chrome.quit()
+            self._finish_merges()
+
             if self.is_running:
                 self.finished_signal.emit(True, "ดาวน์โหลดเสร็จสิ้น")
             else:

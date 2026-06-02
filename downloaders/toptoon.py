@@ -34,8 +34,24 @@ class ToptoonDownloader(BaseDownloader):
         except Exception:
             return f"Toptoon_{int(time.time())}"
 
+    @staticmethod
+    def _collect_urls(driver):
+        """คืน URL รูป (.document_img) ที่เห็นตอนนี้ — เอา data-src (URL จริง) ก่อน src"""
+        urls = []
+        try:
+            for el in driver.find_elements(By.CSS_SELECTOR, ".document_img"):
+                try:
+                    u = el.get_attribute("data-src") or el.get_attribute("src")
+                except Exception:
+                    u = None
+                if u:
+                    urls.append(u)
+        except Exception:
+            pass
+        return urls
+
     def download_chapter(self, driver, save_path, ctx: DownloaderContext) -> int:
-        ctx.log("   - 🎯 เริ่มดาวน์โหลด (Fast URL mode)")
+        ctx.log("   - 🎯 เริ่มดาวน์โหลด (URL mode)")
         try:
             WebDriverWait(driver, 10).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, ".document_img"))
@@ -44,45 +60,27 @@ class ToptoonDownloader(BaseDownloader):
             ctx.log("   ❌ ไม่พบรูปภาพ (ต้องซื้อตอน?)")
             return 0
 
-        # ✅ verify: เลื่อนหน้าโหลด lazy ให้ภาพมาครบก่อน (กันเน็ตช้า → เก็บ <img> ไม่ครบ)
-        images = self.wait_count_stable(
-            driver, ctx,
-            lambda d: d.find_elements(By.CSS_SELECTOR, ".document_img"),
-        )
-        if not images:
+        # ✅ เก็บ URL สะสม (dedup) ระหว่างเลื่อน — กัน lazy/virtualize ทำให้ได้ไม่ครบ
+        urls = self.collect_urls_scrolling(driver, ctx, self._collect_urls)
+        if not urls:
             ctx.log("   ❌ ไม่พบรูปภาพ (ต้องซื้อตอน?)")
             return 0
 
-        total = len(images)
+        total = len(urls)
         ctx.log(f"   - 📦 พบ {total} รูป (ยืนยันโหลดครบแล้ว)")
         session = make_requests_session(driver)
         count = 0
-        for index, img in enumerate(images):
+        for i, url in enumerate(urls, start=1):
             if not ctx.is_running():
                 break
-            filename = f"{str(index + 1).zfill(3)}.jpg"
-            fpath = os.path.join(save_path, filename)
-            if os.path.exists(fpath) and os.path.getsize(fpath) > 0:
+            fpath = os.path.join(save_path, f"{str(i).zfill(3)}.jpg")
+            # โหลดแบบ verified: เช็คครบ (Content-Length + ท้ายไฟล์) + ลองซ้ำ + กันโฟลเดอร์หาย
+            if download_url_verified(session, url, fpath, log=ctx.log):
                 count += 1
-                continue
-            try:
-                driver.execute_script(
-                    "arguments[0].scrollIntoView({behavior:'auto', block:'center'});",
-                    img,
-                )
-                url = img.get_attribute("data-src") or img.get_attribute("src")
-                if not url:
-                    ctx.log(f"      ❌ ข้าม #{index+1} (ยังไม่มี URL รูป)")
-                    continue
-                # โหลดแบบ verified: เช็คครบ (Content-Length + ท้ายไฟล์) + ลองใหม่ถ้าขาด
-                if download_url_verified(session, url, fpath, log=ctx.log):
-                    count += 1
-                    ctx.log(f"      ✅ Save: {filename} [{count}/{total}]")
-                    ctx.progress(count, total)
-                else:
-                    ctx.log(f"      ❌ Load Failed: {filename}")
-            except Exception as e:
-                ctx.log(f"      ❌ Error #{index+1}: {e}")
+                ctx.log(f"      ✅ Save: {i:03d}.jpg [{count}/{total}]")
+                ctx.progress(count, total)
+            else:
+                ctx.log(f"      ❌ Load Failed: {i:03d}.jpg")
 
         if count < total:
             ctx.log(

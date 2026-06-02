@@ -3,18 +3,17 @@ from __future__ import annotations
 
 import os
 import time
-import base64
 
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import StaleElementReferenceException
 
 from .base import (
     BaseDownloader,
     DownloaderContext,
     register_downloader,
     sanitize_filename,
+    write_bytes_safe,
 )
 
 
@@ -43,119 +42,47 @@ class RidiDownloader(BaseDownloader):
         except Exception:
             return f"Ridi_Unknown_{int(time.time())}"
 
-    # selector รูปการ์ตูน (ไล่ตามลำดับ เอาตัวแรกที่เจอ)
-    _IMG_SELECTORS = (
-        "img.wv-1ago99h",
-        "img[class*='wv-1ago99h']",
-        "img[src*='blob:']",
-    )
-
-    def _collect_imgs(self, driver):
-        """คืน list<WebElement> รูปการ์ตูนล่าสุดบนหน้า (ไล่ selector เอาตัวแรกที่เจอ)"""
-        for sel in self._IMG_SELECTORS:
-            try:
-                found = driver.find_elements(By.CSS_SELECTOR, sel)
-                if found:
-                    return found
-            except Exception:
-                continue
-        return []
+    # body ของ isComic(img) สำหรับ engine กลาง scroll_and_capture_blobs (ใน base.py):
+    #   หน้าการ์ตูน Ridi = <img src="blob:..."> (decode ฝั่ง client เหมือน Bomtoon)
+    _COMIC_FILTER_JS = r"""
+    const s = img.currentSrc || img.src || '';
+    if (!s) return false;
+    if (s.startsWith('blob:')) return true;
+    return false;
+    """
 
     # -------- download --------
     def download_chapter(self, driver, save_path, ctx: DownloaderContext) -> int:
-        ctx.log("   - 🎯 เริ่มดาวน์โหลด (Canvas mode)...")
-        time.sleep(2)
+        ctx.log("   - 🎯 เริ่มดาวน์โหลด (fetch blob ต้นฉบับ + canvas สำรอง)")
+        time.sleep(1)
 
-        # รอให้มีรูปโผล่ก่อน (อย่างน้อย 1 ใบ)
+        # รอให้มีรูป blob โผล่ก่อน (อย่างน้อย 1 ใบ)
         try:
-            WebDriverWait(driver, 8).until(
+            WebDriverWait(driver, 12).until(
                 EC.presence_of_element_located((By.CSS_SELECTOR, "img[src*='blob:']"))
             )
         except Exception:
             pass
 
-        # ✅ verify: รอให้ภาพ 'โหลดครบทุกใบ' ก่อนเริ่มดูด (กันเน็ตช้า → ได้ภาพไม่ครบ)
-        images = self.wait_images_loaded(driver, ctx, self._collect_imgs)
-        if not images:
+        # ดูดแบบ scroll + dedup ผ่าน engine กลาง (กันภาพไม่ครบ + canvas เปล่า)
+        captured = self.scroll_and_capture_blobs(
+            driver, ctx, self._COMIC_FILTER_JS, to_jpeg=True
+        )
+        if not captured:
             ctx.log("   ❌ ไม่พบรูปภาพ (Login แล้ว / เปิดหน้าตอนแล้ว?)")
             return 0
 
-        total = len(images)
-        ctx.log(f"   - 📦 พบ {total} รูป (ยืนยันโหลดครบแล้ว)")
+        # เรียงตามตำแหน่งแนวตั้ง (บน→ล่าง) แล้วบันทึก 001.jpg, 002.jpg, ...
+        items = sorted(captured.values(), key=lambda t: t[0])
         count = 0
-        for index, img in enumerate(images):
+        for index, (_y, jpg) in enumerate(items, start=1):
             if not ctx.is_running():
                 break
-            filename = f"{str(index + 1).zfill(3)}.jpg"
-            fpath = os.path.join(save_path, filename)
-            if os.path.exists(fpath) and os.path.getsize(fpath) > 0:
+            fpath = os.path.join(save_path, f"{str(index).zfill(3)}.jpg")
+            if write_bytes_safe(fpath, jpg, ctx.log):
                 count += 1
-                continue
-            try:
-                driver.execute_script(
-                    "arguments[0].scrollIntoView({behavior:'auto', block:'center'});",
-                    img,
-                )
-                time.sleep(0.3)
-                ready = driver.execute_script(
-                    "var i=arguments[0]; return i.complete && i.naturalWidth>0 && "
-                    "(i.src.startsWith('blob:')||i.src.startsWith('data:'));",
-                    img,
-                )
-                if not ready:
-                    driver.execute_script(
-                        "window.scrollBy(0,-50);"
-                        "setTimeout(()=>window.scrollBy(0,50),100);"
-                    )
-                    start = time.time()
-                    while time.time() - start < 10:   # เน็ตช้า: รอนานขึ้นแทนการข้ามทิ้ง
-                        if not ctx.is_running():
-                            break
-                        time.sleep(0.4)
-                        ready = driver.execute_script(
-                            "var i=arguments[0]; return i.complete && i.naturalWidth>0 && "
-                            "(i.src.startsWith('blob:')||i.src.startsWith('data:'));",
-                            img,
-                        )
-                        if ready:
-                            break
-                if not ready:
-                    ctx.log(f"      ❌ ข้าม #{index+1} (โหลดไม่ทัน)")
-                    continue
-
-                b64 = driver.execute_script(
-                    """
-                    var img=arguments[0];
-                    try{
-                      var c=document.createElement('canvas');
-                      c.width=img.naturalWidth; c.height=img.naturalHeight;
-                      c.getContext('2d').drawImage(img,0,0);
-                      return c.toDataURL('image/jpeg',0.90);
-                    }catch(e){return null;}
-                    """,
-                    img,
-                )
-                if b64 and "base64," in b64:
-                    _, enc = b64.split("base64,", 1)
-                    with open(fpath, "wb") as f:
-                        f.write(base64.b64decode(enc))
-                    count += 1
-                    size = os.path.getsize(fpath)
-                    ctx.log(f"      ✅ Save: {filename} ({size}B) [{count}/{total}]")
-                    ctx.progress(count, total)
-                else:
-                    ctx.log(f"      ❌ Save Failed: {filename}")
-            except StaleElementReferenceException:
-                ctx.log(f"      ⚠️ Element หลุด")
-            except Exception as e:
-                ctx.log(f"      ⚠️ Error: {e}")
-
-        if count < total:
-            ctx.log(
-                f"   - ⚠️ ได้ภาพไม่ครบ: {count}/{total} ใบ (เน็ตช้า) — แนะนำโหลดตอนนี้ซ้ำ"
-            )
-        else:
-            ctx.log(f"   - ✅ ครบทุกใบ: {count}/{total}")
+        ctx.progress(count, count)
+        ctx.log(f"   - ✅ ดูดครบ {count} ใบ (fetch blob ต้นฉบับ)")
         return count
 
     # -------- next --------

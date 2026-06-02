@@ -1,18 +1,20 @@
-"""Bomtoon downloader (blob: URL → Canvas method + SN watermark stripper)
+"""Bomtoon downloader (fetch blob ต้นฉบับ + scroll-and-capture)
 
-Bomtoon ใช้ <img src="blob:..."> ที่ browser ดึงผ่าน FileReader/MediaSource
-ดังนั้นต้องดูดผ่าน canvas.toDataURL() เหมือน Ridi (requests ดึง blob: ไม่ได้)
+Bomtoon เรนเดอร์หน้าการ์ตูนเป็น <img src="blob:..."> (decode ฝั่ง client) ซึ่ง
+requests ดึง blob: ไม่ได้ จึงต้องดูดในหน้าเว็บ วิธีที่ใช้:
+  - เลื่อนบน→ล่าง แล้ว fetch(blobURL) เอา "bytes ต้นฉบับ" ของหน้าที่ยังไม่เคยเก็บ
+    (dedup ด้วย URL) → ได้ไฟล์เต็มใบ ไม่มี canvas เปล่า ไม่เสียคุณภาพ ครบทุกใบ
+  - canvas.toDataURL() เป็นแค่ fallback เมื่อ fetch ไม่ได้
+  - เรียงหน้าด้วยตำแหน่งแนวตั้ง (Y) = ลำดับการอ่าน
 
-นอกจากนี้ยังฝัง SN (serial number) เป็น <span> ที่มี attribute size/scale พิเศษ
-เช่น <span size="12" color="#343432" scale="1.0" class="sc-cUEIKg cmUyli">lcJ6D</span>
-script นี้จะลบ SN spans ออกก่อนเริ่มดูด
+SN (serial number) เป็น <span size/scale> overlay ซ้อนบนรูป — ไม่ได้ฝังในไฟล์ blob
+จึงไม่ติดมากับ fetch (ยังลบ spans ทิ้งไว้กัน DOM รก)
 """
 from __future__ import annotations
 
 import os
 import re
 import time
-import base64
 
 from typing import Optional
 
@@ -20,13 +22,14 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
+from selenium.common.exceptions import TimeoutException
 
 from .base import (
     BaseDownloader,
     DownloaderContext,
     register_downloader,
     sanitize_filename,
+    write_bytes_safe,
 )
 
 LOGIN_URL = "https://www.bomtoon.com/user/login"
@@ -226,79 +229,21 @@ class BomtoonDownloader(BaseDownloader):
 })();
 """
 
-    # scroll ลงทีละขั้น + หยุดทันทีที่ location.href เปลี่ยน (viewer auto-advance)
-    # + safety timeout 22s กัน hang ('script timeout')
-    # หยุดเมื่อ "ถึงล่าง + scrollHeight นิ่ง" (รอ lazy-load ขยายหน้าจนสุด)
-    # ไม่ใช่แค่แตะล่างครั้งเดียว เพราะหน้าโตเรื่อย ๆ ตอน scroll (lazy)
-    _SCROLL_ASYNC_JS = r"""
-const done = arguments[arguments.length - 1];
-const startUrl = location.href;
-let lastH = -1, stable = 0;
-const t0 = Date.now();
-const id = setInterval(() => {
-  try {
-    if (location.href !== startUrl) { clearInterval(id); window.scrollTo(0,0); done('drift'); return; }
-    if (Date.now() - t0 > 30000) { clearInterval(id); window.scrollTo(0,0); done('timeout'); return; }
-    const sh = document.body.scrollHeight;
-    window.scrollBy(0, 1400);
-    const atBottom = (window.scrollY + window.innerHeight >= sh - 4);
-    if (atBottom && sh === lastH) {
-      stable++;
-      if (stable >= 8) { clearInterval(id); window.scrollTo(0,0); done('bottom'); return; }
-    } else {
-      stable = 0;
-    }
-    lastH = sh;
-  } catch (e) { clearInterval(id); done('error'); }
-}, 110);
-"""
-
-    def _scroll_to_load(self, driver, ctx: DownloaderContext) -> str:
-        """scroll ลงทีละขั้นเพื่อปลุก lazy-load — หยุดทันทีถ้า URL เด้ง (auto-advance)
-
-        คืนสถานะ: 'bottom' (ถึงล่างปกติ) / 'drift' (viewer เด้งไปตอนอื่น) /
-                  'timeout' / 'error'
-        """
-        try:
-            driver.set_script_timeout(40)
-        except Exception:
-            pass
-        try:
-            result = driver.execute_async_script(self._SCROLL_ASYNC_JS)
-        except Exception as e:
-            ctx.log(f"   ⚠️ scroll error: {e}")
-            return "error"
-        time.sleep(0.8)
-        if result == "drift":
-            ctx.log("   ⚠️ viewer เด้งไปตอนอื่นระหว่าง scroll")
-        return result or "bottom"
-
-    def _collect_comic_imgs(self, driver):
-        """คืน list<WebElement> เฉพาะ <img> ที่เป็นรูปการ์ตูน (กรอง UI/thumbnail ออก)"""
-        return driver.execute_script(
-            r"""
-            const imgs = Array.from(document.querySelectorAll('img'));
-            return imgs.filter(img => {
-                const src = img.src || '';
-                // ยอมแค่ blob: URL หรือ url ที่ดูเหมือนรูปการ์ตูน
-                if (!src) return false;
-                if (src.startsWith('data:')) return false;
-                const low = src.toLowerCase();
-                if (low.includes('icon') || low.includes('logo')) return false;
-                if (low.includes('banner') || low.includes('thumb')) return false;
-                if (low.includes('/sprite') || low.endsWith('.svg')) return false;
-                const w = img.naturalWidth || img.width || 0;
-                const h = img.naturalHeight || img.height || 0;
-                // รูปการ์ตูน Bomtoon ปกติกว้าง >= 1000px
-                if (w < 600 || h < 200) return false;
-                return true;
-            });
-            """
-        )
+    # body ของ isComic(img) สำหรับ engine กลาง scroll_and_capture_blobs (ใน base.py):
+    #   หน้าการ์ตูน Bomtoon = blob เสมอ; เผื่อหน้า http ใหญ่ ๆ (เช่น copyright)
+    _COMIC_FILTER_JS = r"""
+    const s = img.currentSrc || img.src || '';
+    if (!s || s.startsWith('data:')) return false;
+    if (s.startsWith('blob:')) return true;
+    const low = s.toLowerCase();
+    if (low.includes('icon') || low.includes('logo') || low.includes('banner') ||
+        low.includes('thumb') || low.includes('/sprite') || low.endsWith('.svg')) return false;
+    return (img.naturalWidth >= 1000 && img.naturalHeight >= 600);
+    """
 
     # ----- download -----
     def download_chapter(self, driver, save_path, ctx: DownloaderContext) -> int:
-        ctx.log("   - 🎯 เริ่มดาวน์โหลด (blob → canvas + SN strip)")
+        ctx.log("   - 🎯 เริ่มดาวน์โหลด (fetch blob ต้นฉบับ + canvas สำรอง)")
 
         # จับเลขตอน "ก่อน" scroll — กัน viewer auto-advance ทำ current_url ดริฟต์
         # แล้วไปตอนถัดไปผิด (ข้ามตอน) หรือเก็บรูปผิดตอน
@@ -324,120 +269,36 @@ const id = setInterval(() => {
         except Exception:
             pass
 
-        # ลบ SN + scroll ปลุก lazy load
-        self._strip_sn(driver, ctx)
-        status = self._scroll_to_load(driver, ctx)
-
-        # ถ้า viewer เด้งออกจากตอนนี้ (auto-advance) → กลับมาโหลดตอนเดิมใหม่
-        # (กันได้รูปผิดตอน) — ทำครั้งเดียวพอ
-        if ep and (status == "drift" or self._episode_url_parts(driver.current_url) != ep):
-            want = f"{ep[0]}{ep[1]}"
-            ctx.log(f"   ⚠️ เด้งออกจากตอน {ep[1]} — กลับไปโหลดใหม่: {want}")
-            try:
-                driver.get(want)
-                time.sleep(3)
-                WebDriverWait(driver, 15).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, "img"))
-                )
-            except Exception:
-                pass
-            self._strip_sn(driver, ctx)
-            self._scroll_to_load(driver, ctx)
-
-        # ลบ SN อีกรอบ (กรณีมี element ใหม่หลัง scroll)
+        # ลบ SN overlay (ไม่ติดมากับ fetch อยู่แล้ว แต่ลบไว้กัน DOM รก)
         self._strip_sn(driver, ctx)
 
-        # ✅ verify: รอให้ภาพ 'โหลดครบทุกใบ' ก่อนเริ่มดูด (กันเน็ตช้า → ได้ภาพไม่ครบ)
-        #    เน็ตช้า: <img> ที่ naturalWidth=0 จะถูก _collect_comic_imgs กรองทิ้งตอนนับ
-        images = self.wait_images_loaded(driver, ctx, self._collect_comic_imgs)
-        if not images:
-            ctx.log("   ❌ ไม่พบรูปภาพ (ต้องซื้อตอน?)")
+        # ดูดแบบ scroll + dedup ผ่าน engine กลาง (fetch blob ต้นฉบับ + canvas สำรอง)
+        # กันภาพไม่ครบทุกกรณี ไม่ขึ้นกับว่าโหลดมากี่ใบ ณ ขณะหนึ่ง
+        captured = self.scroll_and_capture_blobs(
+            driver, ctx, self._COMIC_FILTER_JS, to_jpeg=True
+        )
+
+        # กันเก็บรูปผิดตอน: ถ้า viewer ดริฟต์ไปตอนอื่นระหว่างโหลด (lock-nav ควรกันได้แล้ว)
+        if ep:
+            now = self._episode_url_parts(driver.current_url)
+            if now is not None and now != ep:
+                ctx.log(f"   ⚠️ ตอนเปลี่ยนระหว่างโหลด ({ep[1]} → {now[1]}) — รูปอาจปนตอน")
+
+        if not captured:
+            ctx.log("   ❌ ไม่พบรูปภาพ (ต้องซื้อตอน? หรือยังไม่ได้ login)")
             return 0
 
-        # ลบ SN อีกครั้งหลังโหลดครบ (กัน watermark ที่เพิ่งโผล่ตอนรูปโหลดเสร็จ)
-        self._strip_sn(driver, ctx)
-
-        total = len(images)
-        ctx.log(f"   - 📦 พบ {total} รูป (ยืนยันโหลดครบแล้ว, canvas mode)")
-
+        # เรียงตามตำแหน่งแนวตั้ง (บน→ล่าง = ลำดับการอ่าน) แล้วบันทึก 001.jpg, 002.jpg, ...
+        items = sorted(captured.values(), key=lambda t: t[0])
         count = 0
-        for index, img in enumerate(images):
+        for index, (_y, jpg) in enumerate(items, start=1):
             if not ctx.is_running():
                 break
-            filename = f"{str(index + 1).zfill(3)}.jpg"
-            fpath = os.path.join(save_path, filename)
-            if os.path.exists(fpath) and os.path.getsize(fpath) > 0:
+            fpath = os.path.join(save_path, f"{str(index).zfill(3)}.jpg")
+            if write_bytes_safe(fpath, jpg, ctx.log):   # กันโฟลเดอร์หาย → สร้างใหม่+ลองซ้ำ
                 count += 1
-                continue
-            try:
-                # 1) scroll element into view เพื่อให้ browser โหลด blob เสร็จจริง
-                driver.execute_script(
-                    "arguments[0].scrollIntoView({behavior:'auto',block:'center'});",
-                    img,
-                )
-                time.sleep(0.25)
-
-                # 2) เช็คความพร้อม (naturalWidth > 0)
-                ready = driver.execute_script(
-                    "var i=arguments[0]; return i.complete && i.naturalWidth>0;", img,
-                )
-                if not ready:
-                    # กระตุ้นด้วย jiggle
-                    driver.execute_script(
-                        "window.scrollBy(0,-50);"
-                        "setTimeout(()=>window.scrollBy(0,50),100);"
-                    )
-                    start = time.time()
-                    while time.time() - start < 10:   # เน็ตช้า: รอนานขึ้นแทนการข้ามทิ้ง
-                        if not ctx.is_running():
-                            break
-                        time.sleep(0.4)
-                        ready = driver.execute_script(
-                            "var i=arguments[0]; return i.complete && i.naturalWidth>0;",
-                            img,
-                        )
-                        if ready:
-                            break
-                if not ready:
-                    ctx.log(f"      ❌ ข้าม #{index+1} (โหลดไม่ทัน)")
-                    continue
-
-                # 3) วาดลง canvas → toDataURL → save
-                b64 = driver.execute_script(
-                    """
-                    var img=arguments[0];
-                    try{
-                      var c=document.createElement('canvas');
-                      c.width=img.naturalWidth; c.height=img.naturalHeight;
-                      c.getContext('2d').drawImage(img,0,0);
-                      return c.toDataURL('image/jpeg',0.92);
-                    }catch(e){return null;}
-                    """,
-                    img,
-                )
-                if b64 and "base64," in b64:
-                    _, enc = b64.split("base64,", 1)
-                    with open(fpath, "wb") as f:
-                        f.write(base64.b64decode(enc))
-                    count += 1
-                    size = os.path.getsize(fpath)
-                    ctx.log(f"      ✅ Save: {filename} ({size}B) [{count}/{total}]")
-                    ctx.progress(count, total)
-                else:
-                    ctx.log(f"      ❌ Save Failed: {filename}")
-            except StaleElementReferenceException:
-                ctx.log(f"      ⚠️ Element หลุด (Stale)")
-            except Exception as e:
-                ctx.log(f"      ⚠️ Error #{index+1}: {e}")
-
-        # สรุปความครบ — แจ้งชัดถ้าได้ไม่ครบ (เน็ตช้า) จะได้รู้ว่าควรโหลดตอนนี้ซ้ำ
-        if count < total:
-            ctx.log(
-                f"   - ⚠️ ได้ภาพไม่ครบ: {count}/{total} ใบ "
-                f"(เน็ตช้า/บางใบโหลดไม่ทัน) — แนะนำโหลดตอนนี้ซ้ำอีกครั้ง"
-            )
-        else:
-            ctx.log(f"   - ✅ ครบทุกใบ: {count}/{total}")
+        ctx.progress(count, count)
+        ctx.log(f"   - ✅ ดูดครบ {count} ใบ (fetch blob ต้นฉบับ คุณภาพเต็ม)")
         return count
 
     # ----- next -----

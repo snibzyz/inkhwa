@@ -6,8 +6,10 @@ from __future__ import annotations
 
 import os
 import re
+import io
 import time
 import json
+import base64
 import shutil
 import requests
 from dataclasses import dataclass, field
@@ -247,21 +249,24 @@ class ChromeManager:
                 self.driver.get(url)
             except Exception as e:
                 self.log(f"⚠️ เปิด URL ไม่ได้ (ครั้งที่ {i+1}): {e}")
-                time.sleep(1.0)
+                time.sleep(0.5)
                 self._consolidate_windows()
                 continue
-            time.sleep(1.5)
-            try:
-                cur = self.driver.current_url or ""
-            except Exception:
-                cur = ""
-            if not self._is_blank(cur):
-                self.log(f"🌐 เปิด URL: {url}")
-                return
+            # poll สั้น ๆ — คืนทันทีที่หน้าเว็บจริงโหลด (ไม่ sleep ยาวคงที่)
+            cur = ""
+            deadline = time.time() + 1.5
+            while time.time() < deadline:
+                try:
+                    cur = self.driver.current_url or ""
+                except Exception:
+                    cur = ""
+                if not self._is_blank(cur):
+                    self.log(f"🌐 เปิด URL: {url}")
+                    return
+                time.sleep(0.15)
             # ยังค้างหน้า New Tab → get() อาจวิ่งคนละแท็บ ลองรวมแท็บแล้วทำซ้ำ
             self.log(f"   ↻ ยังค้างหน้าว่าง (อยู่ที่ {cur or 'ว่าง'}) ลองใหม่...")
             self._consolidate_windows()
-            time.sleep(0.5)
         self.log(f"⚠️ เปิด URL ไม่สำเร็จหลังลอง {attempts} ครั้ง — โปรดเปิดหน้า login เองในหน้าต่าง Chrome")
 
     def quit(self):
@@ -312,10 +317,39 @@ def guess_ext(url: str, default: str = ".jpg") -> str:
     return default
 
 
+def write_bytes_safe(
+    fpath: str, data: bytes, log: Optional[Callable[[str], None]] = None
+) -> bool:
+    """เขียนไฟล์รูปแบบ 'ทนทาน' — กันโฟลเดอร์หายกลางคัน (ไดรฟ์ network/VHD/sync)
+
+    ถ้าเขียนไม่ได้เพราะ parent dir หาย (No such file or directory) → สร้าง dir
+    ใหม่แล้วลองอีกครั้ง (ทำซ้ำได้ไม่กี่รอบ). คืน True เมื่อเขียนสำเร็จ
+    """
+    last = None
+    for _ in range(3):
+        try:
+            with open(fpath, "wb") as f:
+                f.write(data)
+            return True
+        except OSError as e:
+            last = e
+            try:
+                os.makedirs(os.path.dirname(fpath) or ".", exist_ok=True)
+            except Exception:
+                pass
+        except Exception as e:
+            last = e
+            break
+    if log:
+        log(f"      ❌ เขียนไฟล์ไม่ได้: {os.path.basename(fpath)} ({last})")
+    return False
+
+
 def download_url_to(session: requests.Session, url: str, dest: str, timeout: int = 20) -> bool:
     try:
         r = session.get(url, stream=True, timeout=timeout)
         if r.status_code == 200:
+            os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)
             with open(dest, "wb") as f:
                 shutil.copyfileobj(r.raw, f)
             return os.path.getsize(dest) > 0
@@ -372,6 +406,7 @@ def download_url_verified(
                 clen = r.headers.get("Content-Length")
                 expected = int(clen) if (clen and clen.isdigit()) else None
                 written = 0
+                os.makedirs(os.path.dirname(dest) or ".", exist_ok=True)  # กันโฟลเดอร์หาย
                 with open(dest, "wb") as f:
                     for chunk in r.iter_content(chunk_size=65536):
                         if chunk:
@@ -698,6 +733,213 @@ return imgs.map(i => {
             time.sleep(0.8)
         ctx.log(f"   - ⚠️ จำนวน{label}อาจยังไม่ครบ (เน็ตช้า): {len(last)}")
         return last
+
+    # =====================================================================
+    # Engine กลางสำหรับ "ดูดภาพให้ครบ" (ใช้ร่วมกันทุกเว็บ)
+    # =====================================================================
+    @staticmethod
+    def verify_image_bytes(raw: bytes, *, to_jpeg: bool = True, check_blank: bool = True):
+        """ยืนยันภาพ 'ไม่ขาด/ไม่เปล่า' ด้วย PIL — คืน bytes (อาจแปลง JPEG) หรือ None
+
+        - เปิด + load() = บังคับ decode (ภาพขาด/เสียจะ error ตรงนี้)
+        - check_blank: สีเดียวทั้งใบ = ดูดไม่ติด → None (ใช้กับ canvas)
+        - to_jpeg=True คืน JPEG (ของเดิมถ้าเป็น JPEG/RGB อยู่แล้ว ไม่ re-encode)
+          to_jpeg=False คืน bytes เดิม (เก็บ PNG/format เดิม)
+        """
+        if not raw or len(raw) < 100:
+            return None
+        try:
+            from PIL import Image
+        except Exception:
+            # ไม่มี PIL: เชื่อ raw ถ้าเป็น JPEG/PNG
+            if raw[:2] == b"\xff\xd8" or raw[:8] == b"\x89PNG\r\n\x1a\n":
+                return raw
+            return None
+        try:
+            im = Image.open(io.BytesIO(raw))
+            im.load()
+        except Exception:
+            return None
+        if check_blank:
+            try:
+                ex = im.convert("RGB").getextrema()
+                if all(lo == hi for (lo, hi) in ex):
+                    return None
+            except Exception:
+                pass
+        if not to_jpeg:
+            return raw
+        if im.format == "JPEG" and im.mode == "RGB":
+            return raw
+        try:
+            buf = io.BytesIO()
+            (im if im.mode == "RGB" else im.convert("RGB")).save(buf, "JPEG", quality=95)
+            return buf.getvalue()
+        except Exception:
+            return None
+
+    # JS: ดูด "รูป blob ที่ยังไม่เคยเก็บ" รอบละไม่เกิน maxBatch ใบ (%s = body ของ isComic)
+    #  fetch(blobURL) เอา bytes ต้นฉบับ → ไม่มี canvas เปล่า ไม่เสียคุณภาพ; canvas = fallback
+    _BLOB_BATCH_JS_TMPL = r"""
+const seenUrls = arguments[0];
+const maxBatch = arguments[1];
+const done = arguments[arguments.length - 1];
+(async () => {
+  const seen = new Set(seenUrls);
+  const isComic = (img) => { %s };
+  const imgs = Array.from(document.querySelectorAll('img')).filter(isComic);
+  const out = [];
+  try {
+    for (const img of imgs) {
+      const url = img.currentSrc || img.src;
+      if (!url || seen.has(url)) continue;
+      const rect = img.getBoundingClientRect();
+      const rec = { url, y: Math.round(rect.top + window.scrollY) };
+      if (url.slice(0, 5) !== 'data:') {
+        try {
+          const resp = await fetch(url, { cache: 'force-cache' });
+          if (resp.ok) {
+            const blob = await resp.blob();
+            if (blob && blob.size > 0) {
+              rec.dataUrl = await new Promise((res, rej) => {
+                const r = new FileReader();
+                r.onload = () => res(r.result); r.onerror = () => rej(new Error('reader'));
+                r.readAsDataURL(blob);
+              });
+              rec.via = 'fetch'; rec.size = blob.size;
+            }
+          } else { rec.fetchErr = 'http ' + resp.status; }
+        } catch (e) { rec.fetchErr = String(e); }
+      }
+      if (!rec.dataUrl) {
+        try { await img.decode(); } catch (e) {}
+        if (img.complete && img.naturalWidth > 0) {
+          const c = document.createElement('canvas');
+          c.width = img.naturalWidth; c.height = img.naturalHeight;
+          c.getContext('2d').drawImage(img, 0, 0);
+          rec.dataUrl = c.toDataURL('image/jpeg', 0.95); rec.via = 'canvas';
+        }
+      }
+      out.push(rec);
+      if (out.length >= maxBatch) break;
+    }
+  } catch (e) {}
+  done(out);
+})();
+"""
+
+    def scroll_and_capture_blobs(
+        self, driver, ctx: "DownloaderContext", filter_js: str,
+        *, to_jpeg: bool = True, max_batch: int = 8,
+    ) -> dict:
+        """เลื่อนบน→ล่าง + fetch ดูดรูป blob ที่ "ยังไม่เคยเก็บ" (dedup) — engine กลาง
+
+        ใช้กับเว็บที่หน้าการ์ตูนเป็น <img> (blob:/http) เช่น Bomtoon/Ridi:
+        วนเลื่อน+เก็บเพิ่มจน "ถึงล่าง + ไม่มีใหม่ 5 รอบ" → ครบแน่นอนแม้จำนวนที่โหลด
+        ณ ขณะหนึ่งจะแกว่ง. filter_js = body ของ isComic(img) (JS, return true/false)
+        คืน dict: url -> (y, bytes)  เรียงด้วย y ได้เป็นลำดับการอ่าน
+        """
+        js = self._BLOB_BATCH_JS_TMPL % filter_js
+        captured: dict = {}
+        try:
+            driver.execute_script("window.scrollTo(0,0);")
+        except Exception:
+            pass
+        time.sleep(0.4)
+        no_new = 0
+        y = 0
+        for _ in range(600):          # safety cap
+            if not ctx.is_running():
+                break
+            try:
+                driver.set_script_timeout(45)
+                batch = driver.execute_async_script(js, list(captured.keys()), max_batch)
+            except Exception as e:
+                ctx.log(f"   ⚠️ ดูดรอบนี้ error: {e}")
+                batch = []
+            got = 0
+            for rec in batch or []:
+                if not isinstance(rec, dict):
+                    continue
+                url = rec.get("url")
+                data_url = rec.get("dataUrl") or ""
+                if not url or "base64," not in data_url:
+                    continue
+                try:
+                    raw = base64.b64decode(data_url.split("base64,", 1)[1])
+                except Exception:
+                    continue
+                out = self.verify_image_bytes(
+                    raw, to_jpeg=to_jpeg, check_blank=(rec.get("via") == "canvas")
+                )
+                if out is None:
+                    continue          # เปล่า/ขาด → รอบหน้าลองใหม่
+                if url not in captured:
+                    got += 1
+                captured[url] = (rec.get("y", 0), out)
+            if got:
+                ctx.progress(len(captured), len(captured))
+                ctx.log(f"   - 📥 ดูดแล้ว {len(captured)} ใบ...")
+            no_new = 0 if got else no_new + 1
+            try:
+                at_bottom = bool(driver.execute_script(
+                    "return (window.scrollY + window.innerHeight) >= "
+                    "(document.body.scrollHeight - 4);"
+                ))
+            except Exception:
+                at_bottom = True
+            if at_bottom and no_new >= 5 and captured:
+                break
+            y += 1000
+            try:
+                driver.execute_script(f"window.scrollTo(0,{y});")
+            except Exception:
+                pass
+            time.sleep(0.2)
+        return captured
+
+    def collect_urls_scrolling(
+        self, driver, ctx: "DownloaderContext", collect_urls,
+        *, label: str = "รูป", overall_timeout: float = 120.0, stable_rounds: int = 3,
+    ) -> list:
+        """เลื่อนหน้า + เก็บ 'URL รูปสะสม' (dedup) จนไม่มีใหม่ติดกัน stable_rounds รอบ
+
+        ใช้กับเว็บที่รูปเป็น http URL (Kakao/Toptoon) — เก็บสะสมกัน viewer virtualize
+        ถอด <img> เก่าทิ้ง. collect_urls: callable(driver) -> list[str] (URL ที่เห็นตอนนี้)
+        คืน list URL ตามลำดับที่พบครั้งแรก
+        """
+        urls: list = []
+        seen: set = set()
+        stable = 0
+        deadline = time.time() + overall_timeout
+        while time.time() < deadline and ctx.is_running():
+            new = 0
+            try:
+                for u in collect_urls(driver) or []:
+                    if u and u not in seen:
+                        seen.add(u)
+                        urls.append(u)
+                        new += 1
+            except Exception:
+                pass
+            if new == 0 and urls:
+                stable += 1
+                if stable >= stable_rounds:
+                    break
+            else:
+                stable = 0
+                if new:
+                    ctx.log(f"   - ⏳ เก็บ{label}แล้ว {len(urls)} ใบ (เลื่อนหาเพิ่ม...)")
+            try:
+                driver.execute_script(
+                    "window.scrollBy(0, Math.max(1000, window.innerHeight));"
+                )
+            except Exception:
+                pass
+            time.sleep(0.8)
+        if urls:
+            ctx.log(f"   - ✅ รวบรวม URL {label}ครบ: {len(urls)} ใบ")
+        return urls
 
     # --------- ลูปกลาง (เรียกจาก worker) ---------
     def run_loop(self, driver, base_save_path: str, ctx: DownloaderContext) -> None:

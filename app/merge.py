@@ -79,38 +79,35 @@ def _combine(image_paths: list[str], save_path: str, log: Callable[[str], None])
                 y += t.height
             return canvas, total_h
 
-        # คุมความสูงไม่ให้เกินที่ JPEG/PNG รับได้
+        # คุมความสูงไม่ให้เกินที่ JPEG รับได้ (65500px)
         canvas, total_h = _render(1.0)
         if total_h > _MAX_DIMENSION:
             scale = _MAX_DIMENSION / total_h
             log(f"      💡 สูงเกิน {_MAX_DIMENSION}px — ย่อเหลือ {int(total_h*scale)}px")
             canvas, total_h = _render(scale)
 
-        use_png = total_h > 30000
-        final_path = save_path[:-4] + ".png" if (use_png and save_path.lower().endswith(".jpg")) else save_path
-
+        # บันทึกเป็น JPEG เสมอ (เร็ว + ไฟล์เล็ก) — ไม่ใช้ optimize/PNG ที่ทำให้ช้ามาก
+        # ภาพการ์ตูนยาวแนวตั้งเป็น JPEG คุณภาพ 95 คุณภาพดีพอและเล็กกว่า PNG หลายเท่า
+        os.makedirs(os.path.dirname(save_path) or ".", exist_ok=True)  # กันโฟลเดอร์หาย
         quality = 95
         scale = 1.0
         while True:
             buf = io.BytesIO()
-            if use_png:
-                canvas.save(buf, "PNG", optimize=True)
-            else:
-                canvas.save(buf, "JPEG", quality=quality, optimize=True)
+            canvas.save(buf, "JPEG", quality=quality)
             size = buf.tell()
             if size < _MAX_FILE_SIZE:
-                with open(final_path, "wb") as f:
+                with open(save_path, "wb") as f:
                     f.write(buf.getvalue())
                 buf.close()
                 return True
             buf.close()
             # ไฟล์ใหญ่ไป — ลด quality ก่อน แล้วค่อยย่อขนาด
-            if not use_png and quality > 55:
+            if quality > 55:
                 quality -= 5
             else:
                 scale *= 0.9
                 if scale < 0.3:
-                    canvas.save(final_path, "PNG" if use_png else "JPEG")
+                    canvas.save(save_path, "JPEG", quality=55)
                     return True
                 canvas, total_h = _render(scale)
                 quality = 90

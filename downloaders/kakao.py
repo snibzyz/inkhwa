@@ -41,58 +41,22 @@ class KakaoDownloader(BaseDownloader):
         except Exception:
             return f"Kakao_{int(time.time())}"
 
-    def _collect_all_image_urls(
-        self, driver, ctx: DownloaderContext, overall_timeout: float = 120.0
-    ) -> list:
-        """เลื่อนหน้าทีละช่วง + เก็บ URL รูปสะสม จน 'ไม่มี URL ใหม่' ติดกัน 3 รอบ
-
-        เก็บแบบสะสม (set) กัน viewer virtualize ถอด <img> เก่าทิ้ง → ได้รูปครบทุกใบ
-        คืน list URL ตามลำดับที่พบ
-        """
-        urls: list = []
-        seen: set = set()
-        deadline = time.time() + overall_timeout
-        stable = 0
-
-        def grab():
-            new = 0
-            try:
-                els = driver.find_elements(
-                    By.CSS_SELECTOR, "img[src*='page-edge.kakao.com']"
-                )
-            except Exception:
-                els = []
-            for el in els:
+    @staticmethod
+    def _collect_urls(driver):
+        """คืน URL รูป Kakao (page-edge.kakao.com) ที่เห็นตอนนี้"""
+        urls = []
+        try:
+            for el in driver.find_elements(
+                By.CSS_SELECTOR, "img[src*='page-edge.kakao.com']"
+            ):
                 try:
                     src = el.get_attribute("src")
                 except Exception:
-                    continue
-                if src and "page-edge.kakao.com" in src and src not in seen:
-                    seen.add(src)
+                    src = None
+                if src and "page-edge.kakao.com" in src:
                     urls.append(src)
-                    new += 1
-            return new
-
-        while time.time() < deadline and ctx.is_running():
-            new = grab()
-            if new == 0 and urls:
-                stable += 1
-                if stable >= 3:          # ไม่มีรูปใหม่ติดกัน 3 รอบ = ครบแล้ว
-                    break
-            else:
-                stable = 0
-                if new:
-                    ctx.log(f"   - ⏳ เก็บรูปแล้ว {len(urls)} ใบ (เลื่อนหาเพิ่ม...)")
-            try:
-                driver.execute_script(
-                    "window.scrollBy(0, Math.max(1000, window.innerHeight));"
-                )
-            except Exception:
-                pass
-            time.sleep(0.8)
-
-        if urls:
-            ctx.log(f"   - ✅ รวบรวม URL รูปครบ: {len(urls)} ใบ")
+        except Exception:
+            pass
         return urls
 
     def download_chapter(self, driver, save_path, ctx: DownloaderContext) -> int:
@@ -110,7 +74,7 @@ class KakaoDownloader(BaseDownloader):
         # ✅ verify: เลื่อนหน้าโหลด lazy + 'เก็บ URL สะสม' จนไม่มีรูปใหม่ (กันเน็ตช้า)
         #    viewer Kakao อาจ virtualize (ถอด <img> ที่เลื่อนผ่านออกจาก DOM) จึงต้อง
         #    เก็บสะสมระหว่างเลื่อน ไม่ใช่อ่าน DOM ครั้งเดียว เดี๋ยวได้รูปไม่ครบ
-        urls = self._collect_all_image_urls(driver, ctx)
+        urls = self.collect_urls_scrolling(driver, ctx, self._collect_urls)
         if not urls:
             ctx.log("   ❌ ไม่พบรูปภาพ")
             return 0
